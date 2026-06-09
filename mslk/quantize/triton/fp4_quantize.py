@@ -124,13 +124,25 @@ def _fp32_to_e2m1_nibble(v):
     ax = tl.minimum(ax, 6.0)
     # Midpoints between consecutive E2M1 levels; values *at* a midpoint
     # round up (nearest, ties-away-from-zero — matches PTX rn for positives).
-    mag = tl.where(ax < 0.25, 0,
-          tl.where(ax < 0.75, 1,
-          tl.where(ax < 1.25, 2,
-          tl.where(ax < 1.75, 3,
-          tl.where(ax < 2.5,  4,
-          tl.where(ax < 3.5,  5,
-          tl.where(ax < 5.0,  6, 7)))))))
+    mag = tl.where(
+        ax < 0.25,
+        0,
+        tl.where(
+            ax < 0.75,
+            1,
+            tl.where(
+                ax < 1.25,
+                2,
+                tl.where(
+                    ax < 1.75,
+                    3,
+                    tl.where(
+                        ax < 2.5, 4, tl.where(ax < 3.5, 5, tl.where(ax < 5.0, 6, 7))
+                    ),
+                ),
+            ),
+        ),
+    )
     return ((sign << 3) | mag).to(tl.int32)
 
 
