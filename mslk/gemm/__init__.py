@@ -23,9 +23,9 @@ import torch._utils_internal  # noqa: E402
 
 torch._utils_internal.REQUIRES_SET_PYTHON_MODULE = False
 
-from . import _meta  # noqa: F401, E402
-
 import torch  # noqa: E402
+
+from . import _meta  # noqa: F401, E402
 
 if torch.version.hip is not None:
     # Register the Triton implementation of mx8mx4bf16 for ROCm.  This import
