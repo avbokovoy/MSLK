@@ -333,144 +333,145 @@ def _mx8mx4bf16_grouped_kernel(
     XS_ptr,  # flat uint8  _to_blocked layout, groups concatenated
     WS_ptr,  # flat uint8  _to_blocked layout, groups stacked (all same N)
     Out_ptr,  # [total_M, N]   bfloat16
-    offsets_ptr,  # [G]            int32  cumulative row-end per group
-    xs_offsets_ptr,  # [G]            int32  byte offset into XS_ptr for each group
-    m_tiles_ptr,  # [5*G]          int32  cumulative pid_m tile-ends for each
-    #                       BLOCK_M in {16,32,64,128,256} × group
-    total_M,  # used only for autotuner key/prune; not referenced in kernel body
+    m_sizes_ptr,  # [G]  int32  per-group M size
+    m_starts_ptr,  # [G]  int32  per-group absolute M start row in XQ / Out
+    total_M,  # autotuner key / prune hint; not used in kernel body
     N,
     K,
     stride_xm,
     stride_xk,
     stride_wg,
     stride_wk2,
-    stride_wn,  # WQ strides ([G, K//2, N])
+    stride_wn,
     stride_om,
     stride_on,
-    G,
+    NUM_SMS: tl.constexpr,
+    G: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ) -> None:
     """
-    Grouped MXFP8 x MXFP4 GEMM.
+    Persistent grouped MXFP8 x MXFP4 GEMM.
 
-    Each CTA is assigned to a tile within ONE group's M range, guaranteed by the grid.
-    The grid uses sum_g(ceil(M_g / BLOCK_M)) tiles along M so tiles never cross group
-    boundaries. This avoids using wrong-group scales for cross-boundary rows.
+    Grid is fixed at (NUM_SMS,).  Each CTA owns program_id(0) = tidx and
+    repeatedly claims tiles across all groups, stepping by NUM_SMS, until
+    all tiles are exhausted.  This eliminates any dependency between grid
+    size and runtime tensor values, making the kernel CUDA-graph safe.
 
-    m_tiles_ptr holds cumulative tile counts for all BLOCK_M candidates (5 rows × G cols).
-    The kernel selects the right row via BLOCK_M constexpr.
+    xs_offset for each group is accumulated in the outer group loop rather
+    than loaded from a pre-computed pointer, so no CPU->GPU metadata copy
+    for scale offsets is required.
     """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    tidx = tl.program_id(0)
 
     SCALE_BLOCK_K: tl.constexpr = BLOCK_K // 32
-
-    # ---- select m_tiles row for this BLOCK_M value ----
-    if BLOCK_M == 16:  # noqa: SIM108
-        bm_row: tl.constexpr = 0
-    elif BLOCK_M == 32:
-        bm_row: tl.constexpr = 1
-    elif BLOCK_M == 64:
-        bm_row: tl.constexpr = 2
-    elif BLOCK_M == 128:
-        bm_row: tl.constexpr = 3
-    else:  # BLOCK_M == 256
-        bm_row: tl.constexpr = 4
-    m_tiles_base = m_tiles_ptr + bm_row * G
-
-    # ---- map pid_m to (group_id, local_tile_within_group) ----
-    # m_tiles_base[g] = cumulative tile count for groups 0..g for this BLOCK_M.
-    group_id = 0
-    group_tile_start = 0
-    group_start = 0
-    for g in tl.range(0, G):
-        tile_end = tl.load(m_tiles_base + g)
-        if pid_m >= tile_end:
-            group_id = g + 1
-            group_tile_start = tile_end
-            group_start = tl.load(offsets_ptr + g)
-
-    # local tile index within this group, and its starting local row
-    local_tile = pid_m - group_tile_start
-    local_m_start = local_tile * BLOCK_M
-    abs_m_start = group_start + local_m_start
-
-    offs_m = abs_m_start + tl.arange(0, BLOCK_M)  # absolute rows in output
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    local_m = local_m_start + tl.arange(0, BLOCK_M)  # row within this group
-
-    group_end = tl.load(offsets_ptr + group_id)  # absolute end row for this group
+    # Number of _to_blocked column blocks per K dimension (K//32 scale cols,
+    # packed 4 per block).  K is constexpr so this folds to a compile-time int.
+    N_COL_BLOCKS: tl.constexpr = (K // 32 + 3) // 4
 
     n_scale_cols = tl.cdiv(K, 32)
-    n_col_blocks = tl.cdiv(n_scale_cols, 4)
-
-    xs_group_offset = tl.load(xs_offsets_ptr + group_id)
-
     ws_n_row_blocks = tl.cdiv(N, 128)
-    ws_group_offset = group_id * (ws_n_row_blocks * n_col_blocks * 512)
+    # Byte stride between groups in WS (all groups share the same N).
+    ws_group_stride = ws_n_row_blocks * N_COL_BLOCKS * 512
 
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    iterated_tiles = 0
+    xs_offset_acc = 0  # running byte offset into XS_ptr for current group
 
-    for k_idx in tl.range(0, tl.cdiv(K, BLOCK_K)):
-        k_start = k_idx * BLOCK_K
-        offs_k = k_start + tl.arange(0, BLOCK_K)
-        offs_k2 = k_start // 2 + tl.arange(0, BLOCK_K // 2)
-        offs_ks = k_start // 32 + tl.arange(0, SCALE_BLOCK_K)
+    for g in tl.range(G):
+        m_size = tl.load(m_sizes_ptr + g)
+        m_start = tl.load(m_starts_ptr + g)
 
-        row_valid = offs_m[:, None] < group_end
-        xq = tl.load(
-            XQ_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
-            mask=row_valid & (offs_k[None, :] < K),
-            other=0,
-        )
+        # Byte offset into XS_ptr for this group (accumulated from previous groups).
+        xs_group_offset = xs_offset_acc
+        ws_group_offset = g * ws_group_stride
 
-        wq = tl.load(
-            WQ_ptr
-            + group_id * stride_wg
-            + offs_k2[:, None] * stride_wk2
-            + offs_n[None, :] * stride_wn,
-            mask=(offs_k2[:, None] < K // 2) & (offs_n[None, :] < N),
-            other=0,
-        )
+        num_m_tiles = tl.cdiv(m_size, BLOCK_M)
+        num_n_tiles = tl.cdiv(N, BLOCK_N)
+        num_tiles = num_m_tiles * num_n_tiles
 
-        ks2d = offs_ks[None, :]
-        lm2d = local_m[:, None]
-        xs_flat = (
-            xs_group_offset
-            + (lm2d // 128 * n_col_blocks + ks2d // 4) * 512
-            + (lm2d % 32) * 16
-            + (lm2d % 128 // 32) * 4
-            + ks2d % 4
-        )
-        xs = tl.load(XS_ptr + xs_flat, mask=row_valid & (ks2d < n_scale_cols), other=0)
+        # Persistent loop: claim every NUM_SMS-th tile that falls in this group.
+        while tidx >= iterated_tiles and tidx < iterated_tiles + num_tiles:
+            # Map flat tile index to (tile_m, tile_n) within this group.
+            gidx = tidx - iterated_tiles
+            tile_m = gidx % num_m_tiles
+            tile_n = gidx // num_m_tiles
 
-        n2d = offs_n[:, None]
-        ws_flat = (
-            ws_group_offset
-            + (n2d // 128 * n_col_blocks + ks2d // 4) * 512
-            + (n2d % 32) * 16
-            + (n2d % 128 // 32) * 4
-            + ks2d % 4
-        )
-        ws = tl.load(WS_ptr + ws_flat, mask=(n2d < N) & (ks2d < n_scale_cols), other=0)
+            local_m_start = tile_m * BLOCK_M
+            abs_m_start = m_start + local_m_start
+            group_end = m_start + m_size
 
-        acc = tl.dot_scaled(
-            xq,
-            xs,
-            "e4m3",
-            wq,
-            ws,
-            "e2m1",
-            acc,
-        )
+            offs_m = abs_m_start + tl.arange(0, BLOCK_M)
+            offs_n = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)
+            local_m = local_m_start + tl.arange(0, BLOCK_M)
 
-    tl.store(
-        Out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
-        acc.to(tl.bfloat16),
-        mask=(offs_m[:, None] < group_end) & (offs_n[None, :] < N),
-    )
+            row_valid = offs_m[:, None] < group_end
+
+            acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+            for k_idx in tl.range(0, tl.cdiv(K, BLOCK_K)):
+                k_start = k_idx * BLOCK_K
+                offs_k = k_start + tl.arange(0, BLOCK_K)
+                offs_k2 = k_start // 2 + tl.arange(0, BLOCK_K // 2)
+                offs_ks = k_start // 32 + tl.arange(0, SCALE_BLOCK_K)
+
+                xq = tl.load(
+                    XQ_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
+                    mask=row_valid & (offs_k[None, :] < K),
+                    other=0,
+                )
+
+                wq = tl.load(
+                    WQ_ptr
+                    + g * stride_wg
+                    + offs_k2[:, None] * stride_wk2
+                    + offs_n[None, :] * stride_wn,
+                    mask=(offs_k2[:, None] < K // 2) & (offs_n[None, :] < N),
+                    other=0,
+                )
+
+                ks2d = offs_ks[None, :]
+                lm2d = local_m[:, None]
+                xs_flat = (
+                    xs_group_offset
+                    + (lm2d // 128 * N_COL_BLOCKS + ks2d // 4) * 512
+                    + (lm2d % 32) * 16
+                    + (lm2d % 128 // 32) * 4
+                    + ks2d % 4
+                )
+                xs = tl.load(
+                    XS_ptr + xs_flat,
+                    mask=row_valid & (ks2d < n_scale_cols),
+                    other=0,
+                )
+
+                n2d = offs_n[:, None]
+                ws_flat = (
+                    ws_group_offset
+                    + (n2d // 128 * N_COL_BLOCKS + ks2d // 4) * 512
+                    + (n2d % 32) * 16
+                    + (n2d % 128 // 32) * 4
+                    + ks2d % 4
+                )
+                ws = tl.load(
+                    WS_ptr + ws_flat,
+                    mask=(n2d < N) & (ks2d < n_scale_cols),
+                    other=0,
+                )
+
+                acc = tl.dot_scaled(xq, xs, "e4m3", wq, ws, "e2m1", acc)
+
+            tl.store(
+                Out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+                acc.to(tl.bfloat16),
+                mask=row_valid & (offs_n[None, :] < N),
+            )
+
+            tidx += NUM_SMS
+
+        iterated_tiles += num_tiles
+        # Advance xs byte offset: ceil(m_size / 128) row-blocks × N_COL_BLOCKS × 512 bytes.
+        xs_offset_acc += tl.cdiv(m_size, 128) * N_COL_BLOCKS * 512
 
 
 def matmul_mx8mx4bf16_grouped(
@@ -519,48 +520,26 @@ def matmul_mx8mx4bf16_grouped(
     wq_raw = WQ.view(torch.uint8)  # [G, K//2, N]
     xs_raw = x_scale.view(torch.uint8).contiguous()
     ws_raw = w_scale.view(torch.uint8).contiguous()
-    offsets_i32 = offsets.to(torch.int32)
 
-    # Compute per-group byte offsets into xs_raw.
-    # Each group g contributes ceil(M_g, 128) * n_col_blocks * 512 bytes.
-    # Empty groups (M_g == 0) contribute 0 bytes and are skipped in xs_raw.
-    n_col_blocks = (K // 32 + 3) // 4
+    # Derive m_sizes and m_starts on the GPU — all async, no CPU sync.
+    # m_starts[g] = cumulative row start for group g  (= 0, offsets[0], offsets[1], …)
+    # m_sizes[g]  = number of rows in group g         (= offsets[g] - offsets[g-1])
+    offsets_i32 = offsets.to(dtype=torch.int32, device=XQ.device)
     m_starts = torch.cat(
-        [torch.zeros(1, dtype=torch.int32, device=offsets.device), offsets_i32[:-1]]
+        [torch.zeros(1, dtype=torch.int32, device=XQ.device), offsets_i32[:-1]]
     )
     m_sizes = offsets_i32 - m_starts
-    xs_group_sizes = ((m_sizes + 127) // 128) * n_col_blocks * 512
-    xs_offsets = torch.cat(
-        [
-            torch.zeros(1, dtype=torch.int32, device=offsets.device),
-            xs_group_sizes.cumsum(0, dtype=torch.int32)[:-1],
-        ]
-    )
 
-    # Precompute cumulative tile counts for all 5 BLOCK_M candidates {16,32,64,128,256}.
-    # m_tiles[bm_row, g] = cumulative M-tile count for groups 0..g at BLOCK_M=bm.
-    # Stored flat as [5*G] int32 so the kernel can index [bm_row * G + group_id].
-    # This lets the kernel select the right row via BLOCK_M constexpr without
-    # any dependency on which config the autotuner chooses.
-    _bm_values = [16, 32, 64, 128, 256]
-    m_tiles = torch.stack(
-        [((m_sizes + bm - 1) // bm).cumsum(0, dtype=torch.int32) for bm in _bm_values]
-    ).contiguous()  # [5, G] int32, on same device as offsets
+    NUM_SMS = torch.cuda.get_device_properties(XQ.device).multi_processor_count
 
-    def grid(meta):  # noqa: E731
-        bm = meta["BLOCK_M"]
-        total_m_tiles = int(((m_sizes + bm - 1) // bm).sum().item())
-        return (total_m_tiles, triton.cdiv(N, meta["BLOCK_N"]))
-
-    _mx8mx4bf16_grouped_kernel[grid](
+    _mx8mx4bf16_grouped_kernel[(NUM_SMS,)](
         xq_raw,
         wq_raw,
         xs_raw,
         ws_raw,
         output,
-        offsets_i32,
-        xs_offsets,
-        m_tiles,
+        m_sizes,
+        m_starts,
         total_M,
         N,
         K,
@@ -571,7 +550,8 @@ def matmul_mx8mx4bf16_grouped(
         wq_raw.stride(2),
         output.stride(0),
         output.stride(1),
-        G,
+        NUM_SMS=NUM_SMS,
+        G=G,
     )
     return output
 
