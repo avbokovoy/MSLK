@@ -16,7 +16,7 @@ instructions (V_MFMA_SCALE_F32_16X16X128_F8F6F4) available on gfx950
 older CDNA architectures which lack hardware block-scaling support.
 
 Tensor shapes (matching the CUDA CUTLASS convention):
-  XQ      : [M, K]     — MXFP8 E4M3, stored as torch.float8_e4m3fnuz
+  XQ      : [M, K]     — MXFP8 E4M3, stored as torch.float8_e4m3fn (OCP)
   WQ      : [N, K//2]  — MXFP4 E2M1, two nibbles packed per uint8 byte
   x_scale : [M, K//32] — E8M0 per-block scale factors for XQ (block_size=32)
   w_scale : [N, K//32] — E8M0 per-block scale factors for WQ (block_size=32)
@@ -261,7 +261,7 @@ def matmul_mx8mx4bf16(
     scales directly via fused index arithmetic — no _from_blocked copy.
 
     Args:
-        XQ      : [M, K]         torch.float8_e4m3fnuz  — MX-quantised activations
+        XQ      : [M, K]         torch.float8_e4m3fn (OCP)  — MX-quantised activations
         WQ      : [N, K//2]      torch.uint8            — packed MXFP4 (2 nibbles/byte)
         x_scale : flat uint8     — _to_blocked output for XQ scales
         w_scale : flat uint8     — _to_blocked output for WQ scales
@@ -488,7 +488,7 @@ def matmul_mx8mx4bf16_grouped(
     Matches the CUDA mx8mx4bf16_grouped_mm API contract (2D-3D inputs):
 
     Args:
-        XQ       : [total_M, K]    torch.float8_e4m3fnuz  — concatenated activations
+        XQ       : [total_M, K]    torch.float8_e4m3fn (OCP)  — concatenated activations
         WQ       : [G, K//2, N]    torch.float4_e2m1fn_x2 — stacked weights, col-major
                    (caller must pass WQ.transpose(-2, -1) as in CUDA: [G, N, K] -> [G, K//2, N])
         x_scale  : flat uint8 — per-group _to_blocked buffers concatenated (empty groups skipped)
