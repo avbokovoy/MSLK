@@ -34,4 +34,8 @@ if torch.version.hip is not None:
     # in mx8mx4_gemm.py, which overrides the default (non-existent) CUDA impl
     # so that torch.ops.mslk.mx8mx4bf16/_grouped dispatches to the Triton
     # kernel on AMD.
-    from .triton import mx8mx4_gemm  # noqa: F401
+    from .triton import (  # noqa: F401
+        grouped_gemm as _grouped_gemm,
+        mx8mx4_gemm,
+        mx8mx8_gemm,
+    )
