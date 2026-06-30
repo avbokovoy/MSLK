@@ -443,10 +443,16 @@ def matmul_mx8mx8bf16_grouped(
     xs_group_sizes = (m_row_blocks * n_col_blocks * 512).to(torch.int64)
     ws_group_sizes = (n_row_blocks * n_col_blocks * 512).to(torch.int64)
     xs_bases = torch.cat(
-        [torch.zeros(1, dtype=torch.int64, device=XQ.device), xs_group_sizes.cumsum(0)[:-1]]
+        [
+            torch.zeros(1, dtype=torch.int64, device=XQ.device),
+            xs_group_sizes.cumsum(0)[:-1],
+        ]
     )
     ws_bases = torch.cat(
-        [torch.zeros(1, dtype=torch.int64, device=XQ.device), ws_group_sizes.cumsum(0)[:-1]]
+        [
+            torch.zeros(1, dtype=torch.int64, device=XQ.device),
+            ws_group_sizes.cumsum(0)[:-1],
+        ]
     )
 
     grid = lambda meta: (  # noqa: E731
