@@ -8,10 +8,9 @@
 
 // Bridge between MSLK's at::Tensor world and aiter's aiter_tensor_t world.
 // Include this header in any MSLK C++ file that needs to call aiter kernels.
+// Only used in ROCm builds (all consumers are gated in MslkDefault.cmake).
 
 #pragma once
-
-#ifdef USE_ROCM
 
 #include <ATen/ATen.h>
 #include <aiter_tensor.h>
@@ -60,5 +59,3 @@ inline aiter_tensor_t to_aiter_tensor(const at::Tensor& t) {
 }
 
 } // namespace mslk::aiter
-
-#endif // USE_ROCM

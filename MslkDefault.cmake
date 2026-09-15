@@ -13,8 +13,7 @@ glob_files_nohip(mslk_cpp_source_files_cpu
   csrc/conv/*.cpp
   csrc/gemm/*.cpp
   csrc/moe/*.cpp
-  csrc/attention/ck/fmha/*.cpp
-  csrc/aiter/*.cpp)
+  csrc/attention/ck/fmha/*.cpp)
 
 glob_files_nohip(mslk_cpp_source_files_gpu
   csrc/moe/*.cu)
@@ -77,9 +76,15 @@ file(GLOB_RECURSE mslk_cpp_source_files_hip
   csrc/gemm/ck/*.hip
   csrc/gemm/ck/**/*.hip)
 
-# aiter HIP sources (ROCm only) — C++/HIP kernels and ASM wrappers compiled
-# from the external/aiter submodule and local adapter code.
+# aiter sources (ROCm only) — C++/HIP kernels, ASM wrappers, and op
+# registration compiled from the external/aiter submodule and local adapter
+# code.  All aiter sources are ROCm-only so no #ifdef USE_ROCM guards are
+# needed in the source files themselves.
 if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
+  glob_files_nohip(mslk_aiter_cpu_sources
+    csrc/aiter/*.cpp)
+  list(APPEND mslk_cpp_source_files_cpu ${mslk_aiter_cpu_sources})
+
   set(mslk_aiter_hip_sources
     ${THIRDPARTY}/aiter/csrc/kernels/rmsnorm_quant_kernels.cu
     csrc/aiter/asm_topksoftmax.cu)

@@ -7,14 +7,9 @@
  */
 
 // Op schema definitions and ROCm dispatch for aiter-sourced kernels.
-// On ROCm builds, the CUDA dispatch key routes to adapter functions that
-// convert at::Tensor -> aiter_tensor_t and call the aiter implementations.
-// On CUDA builds, only the schema is registered (no impl); a Python-side
-// @torch.library.impl could provide an alternative backend.
+// This file is only compiled on ROCm builds (gated in MslkDefault.cmake).
 
 #include <torch/library.h>
-
-#ifdef USE_ROCM
 #include <mslk/aiter/aiter_bridge.h>
 #include <rmsnorm_quant.h>
 #include <hip/hip_runtime.h>
@@ -55,12 +50,10 @@ at::Tensor aiter_add_rmsnorm_impl(
 }
 
 } // namespace
-#endif // USE_ROCM
 
 namespace mslk::aiter_ops {
 
 TORCH_LIBRARY_FRAGMENT(mslk, m) {
-#ifdef USE_ROCM
   m.def(
       "aiter_rmsnorm(Tensor input, Tensor weight, float epsilon) -> Tensor");
   m.def(
@@ -72,15 +65,12 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
       "Tensor(c!) token_expert_indices, "
       "Tensor gating_output, "
       "bool renormalize) -> ()");
-#endif
 }
 
-#ifdef USE_ROCM
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("aiter_rmsnorm", aiter_rmsnorm_impl);
   m.impl("aiter_add_rmsnorm", aiter_add_rmsnorm_impl);
   // aiter_topk_softmax impl is in asm_topksoftmax.cu
 }
-#endif
 
 } // namespace mslk::aiter_ops

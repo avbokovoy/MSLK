@@ -12,8 +12,7 @@
 // Assembly kernel wrapper for topk_softmax.  Loads a pre-compiled HSACO
 // code object (.co file) at runtime and launches it via hipModuleLaunchKernel.
 // The config header is generated at build time by aiter's hsa/codegen.py.
-
-#ifdef USE_ROCM
+// This file is only compiled on ROCm builds (gated in MslkDefault.cmake).
 
 #include <ATen/ATen.h>
 #include <mslk/aiter/aiter_bridge.h>
@@ -174,5 +173,3 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
 }
 
 } // namespace mslk::aiter_asm
-
-#endif // USE_ROCM
