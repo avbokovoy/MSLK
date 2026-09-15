@@ -692,6 +692,14 @@ def main(argv: List[str]) -> None:
     # where cu126 changes to match the cuda version..
     extras_require = {
         "flash3": ["flash-attn-3"],
+        # aiter (ROCm/aiter) provides optimized Triton/HIP/ASM kernels for
+        # AMD GPUs.  The wheels are published on GitHub Releases, not PyPI,
+        # so users must install the matching wheel first:
+        #   pip install <wheel-url-for-your-rocm-version>
+        # Then:
+        #   pip install mslk[aiter]
+        # See: https://github.com/ROCm/aiter/releases
+        "aiter": ["amd-aiter>=0.1.22"],
     }
 
     packages = setuptools.find_packages()
@@ -724,7 +732,12 @@ def main(argv: List[str]) -> None:
         packages=packages,
         # Ship the prebuilt FlyDSL AOT cache (populated at build time) so it
         # is available at runtime; absent when AOT is not run.
-        package_data={"mslk.flydsl": ["aot_artifacts/*"]},
+        package_data={
+            "mslk.flydsl": ["aot_artifacts/*"],
+            # Pre-compiled HSACO assembly code objects from aiter, loaded at
+            # runtime by hipModuleLoad.  Shipped per GPU architecture.
+            "mslk.aiter": ["hsa/**/*.co"],
+        },
         install_requires=[
             # Only specify numpy, as specifying torch will auto-install the
             # release version of torch, which is not what we want for the
@@ -738,6 +751,13 @@ def main(argv: List[str]) -> None:
             == "rocm"
             else []
         ),
+        # NOTE: aiter (amd-aiter) is NOT listed here.  Its Python layer is
+        # installed from the external/aiter submodule during CI
+        # (AITER_TRITON_ONLY=1 pip install -e external/aiter).  End users
+        # must install it separately:
+        #   pip install amd-aiter==<version in ci/aiter_version.txt>
+        # or:
+        #   AITER_TRITON_ONLY=1 pip install -e external/aiter
         extras_require=extras_require,
         # PyPI package information
         classifiers=[

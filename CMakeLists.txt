@@ -134,7 +134,9 @@ set(mslk_include_directories
   ${THIRDPARTY}/cutlass/tools/util/include
   ${THIRDPARTY}/composable_kernel/include
   ${THIRDPARTY}/composable_kernel/library/include
-  ${NCCL_INCLUDE_DIRS})
+  ${NCCL_INCLUDE_DIRS}
+  # aiter (ROCm/aiter) — C++ headers for HIP and assembly kernel integration
+  ${THIRDPARTY}/aiter/csrc/include)
 
 # The vendored composable_kernel submodule ships `ck/config.h.in` but not the
 # generated `ck/config.h` that `ck/ck.hpp` includes.  ROCm installations provide
@@ -156,6 +158,30 @@ if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
       @ONLY)
     list(APPEND mslk_include_directories ${CMAKE_BINARY_DIR}/ck_config)
   endif()
+endif()
+
+################################################################################
+# aiter Assembly Kernel Config Generation (ROCm only)
+################################################################################
+
+if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM
+    AND EXISTS ${THIRDPARTY}/aiter/hsa/codegen.py)
+  set(AITER_ASM_CONFIG_DIR ${CMAKE_BINARY_DIR}/aiter_asm_configs)
+  file(MAKE_DIRECTORY ${AITER_ASM_CONFIG_DIR})
+
+  add_custom_command(
+    OUTPUT ${AITER_ASM_CONFIG_DIR}/asm_topksoftmax_configs.hpp
+    COMMAND ${Python_EXECUTABLE}
+      ${THIRDPARTY}/aiter/hsa/codegen.py
+      -m topksoftmax
+      --output_dir ${AITER_ASM_CONFIG_DIR}
+    DEPENDS ${THIRDPARTY}/aiter/hsa/codegen.py
+    COMMENT "Generating aiter ASM topksoftmax config header")
+
+  add_custom_target(aiter_asm_configs
+    DEPENDS ${AITER_ASM_CONFIG_DIR}/asm_topksoftmax_configs.hpp)
+
+  list(APPEND mslk_include_directories ${AITER_ASM_CONFIG_DIR})
 endif()
 
 
