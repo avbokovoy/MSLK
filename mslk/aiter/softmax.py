@@ -17,7 +17,6 @@ No source code is vendored — aiter must be installed as a Python package.
 """
 
 import torch
-
 from aiter.ops.triton.softmax import softmax as _aiter_softmax
 
 

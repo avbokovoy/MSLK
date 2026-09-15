@@ -27,7 +27,9 @@ def _skip_unless_rocm(reason: str = "ROCm required"):
 # ---------------------------------------------------------------------------
 
 
-def _reference_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _reference_rmsnorm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
     variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
     x_normed = x * torch.rsqrt(variance + eps)
     return (x_normed * weight).to(x.dtype)
@@ -81,7 +83,9 @@ class TestAiterSoftmax(unittest.TestCase):
 
 @_skip_unless_rocm()
 @unittest.skipUnless(
-    _IS_ROCM and hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "aiter_rmsnorm"),
+    _IS_ROCM
+    and hasattr(torch.ops, "mslk")
+    and hasattr(torch.ops.mslk, "aiter_rmsnorm"),
     "aiter_rmsnorm op not registered (mslk.so built without USE_ROCM?)",
 )
 class TestAiterRmsnorm(unittest.TestCase):
@@ -117,7 +121,9 @@ class TestAiterRmsnorm(unittest.TestCase):
 
 @_skip_unless_rocm()
 @unittest.skipUnless(
-    _IS_ROCM and hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "aiter_topk_softmax"),
+    _IS_ROCM
+    and hasattr(torch.ops, "mslk")
+    and hasattr(torch.ops.mslk, "aiter_topk_softmax"),
     "aiter_topk_softmax op not registered (mslk.so built without USE_ROCM?)",
 )
 class TestAiterTopkSoftmax(unittest.TestCase):
@@ -141,9 +147,7 @@ class TestAiterTopkSoftmax(unittest.TestCase):
             num_tokens, topk_val, device="cuda", dtype=torch.int32
         )
 
-        topk_softmax(
-            topk_weights, topk_indices, token_expert_indices, gating, True
-        )
+        topk_softmax(topk_weights, topk_indices, token_expert_indices, gating, True)
 
         ref_weights, ref_indices = _reference_topk_softmax(gating, topk_val, True)
 
