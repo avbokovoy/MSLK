@@ -76,6 +76,21 @@ file(GLOB_RECURSE mslk_cpp_source_files_hip
   csrc/gemm/ck/*.hip
   csrc/gemm/ck/**/*.hip)
 
+# aiter sources (ROCm only) — C++/HIP kernels, ASM wrappers, and op
+# registration compiled from the external/aiter submodule and local adapter
+# code.  All aiter sources are ROCm-only so no #ifdef USE_ROCM guards are
+# needed in the source files themselves.
+if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
+  glob_files_nohip(mslk_aiter_cpu_sources
+    csrc/aiter/*.cpp)
+  list(APPEND mslk_cpp_source_files_cpu ${mslk_aiter_cpu_sources})
+
+  set(mslk_aiter_hip_sources
+    ${THIRDPARTY}/aiter/csrc/kernels/rmsnorm_quant_kernels.cu
+    csrc/aiter/asm_topksoftmax.cu)
+  list(APPEND mslk_cpp_source_files_hip ${mslk_aiter_hip_sources})
+endif()
+
 # HIP FMHA sources - built separately for only the latest GPU architecture
 # to reduce build time and binary size
 file(GLOB_RECURSE mslk_hip_fmha_sources
@@ -161,6 +176,11 @@ gpu_cpp_library(
   HIP_SPECIFIC_SRCS
     ${mslk_cpp_source_files_hip}
 )
+
+# Ensure aiter ASM config headers are generated before compiling mslk.so.
+if(TARGET aiter_asm_configs)
+  add_dependencies(mslk aiter_asm_configs)
+endif()
 
 # Link FMHA static library with --whole-archive to preserve TORCH_LIBRARY_IMPL
 # static initializers that would otherwise be dropped by the linker.

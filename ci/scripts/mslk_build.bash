@@ -9,6 +9,7 @@
 # shellcheck disable=SC1091,SC2128
 . "$( dirname -- "$BASH_SOURCE"; )/utils_base.bash"
 . "$( dirname -- "$BASH_SOURCE"; )/utils_build.bash"
+. "$( dirname -- "$BASH_SOURCE"; )/utils_aiter.bash"
 
 ################################################################################
 # MSLK Build Auxiliary Functions
@@ -55,6 +56,8 @@ prepare_mslk_build () {
   (install_triton_pip "${env_name}") || return 1
 
   (install_flydsl_pip "${env_name}") || return 1
+
+  (install_aiter_from_submodule "${env_name}") || return 1
 
   # shellcheck disable=SC2086
   (test_python_import_package "${env_name}" numpy) || return 1

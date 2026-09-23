@@ -10,3 +10,6 @@
 [submodule "external/hipify_torch"]
 	path = external/hipify_torch
 	url = https://github.com/ROCm/hipify_torch.git
+[submodule "external/aiter"]
+	path = external/aiter
+	url = https://github.com/ROCm/aiter.git
