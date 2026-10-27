@@ -54,6 +54,10 @@ negative-path test in `test_backward.py`):
   `BlockDiagonalCausalLocalAttentionMask`, is implemented. Rejected the same
   way, via `SUPPORTED_ATTN_BIAS_TYPES` omission. Revisit if a caller needs
   bottom-right causal masking specifically.
+
+`FwOp` non-goals:
+- Gradients through native paged KV: no backend has a paged backward and MSLK's
+  paged callers are forward-only. Declined in `FwOp.not_supported_reasons()`.
 """
 
 import math
