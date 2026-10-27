@@ -1062,13 +1062,24 @@ def _flydsl_flash_attn_paged(
     # Gappy paged uses the generic kernel (any D the generic path builds; the op
     # reshapes the cache to 64-row sub-pages), so skip the native-paged D/page gates.
     _gappy_paged = kv_seqstart is not None
-    if page_size != _PAGED_PAGE_SIZE and not _gappy_paged:
+    # Pages below the 64-row KV tile and D=256 use the light kernel (linear only).
+    _small_pages = page_size < _PAGED_PAGE_SIZE
+    if _small_pages and (vectorized or _PAGED_PAGE_SIZE % page_size != 0):
         raise NotImplementedError(
-            f"flydsl_flash_attn_func: native paged KV supports page_size={_PAGED_PAGE_SIZE} only, got {page_size}"
+            "flydsl_flash_attn_func: paged KV with page_size < "
+            f"{_PAGED_PAGE_SIZE} needs a page_size dividing {_PAGED_PAGE_SIZE} and "
+            f"the linear layout, got page_size={page_size}, "
+            f"layout={kv_cache_layout!r}"
         )
-    if D not in (64, 128) and not _gappy_paged:
+    if page_size > _PAGED_PAGE_SIZE and not _gappy_paged:
         raise NotImplementedError(
-            f"flydsl_flash_attn_func: native paged KV supports head_dim=64 or 128, got {D}"
+            "flydsl_flash_attn_func: native paged KV supports page_size<="
+            f"{_PAGED_PAGE_SIZE}, got {page_size}"
+        )
+    if D not in (64, 128, 256) and not _gappy_paged:
+        raise NotImplementedError(
+            "flydsl_flash_attn_func: native paged KV supports head_dim 64, 128 "
+            f"or 256, got {D}"
         )
     if k_head_dim != D:
         raise ValueError(
@@ -1127,6 +1138,8 @@ def _flydsl_flash_attn_paged(
     _paged_light_ok = (
         _gappy
         or _paged_window
+        or _small_pages
+        or D not in (64, 128)
         or (
             _splitk_dtype_ok
             and (
@@ -1144,6 +1157,10 @@ def _flydsl_flash_attn_paged(
     _auto_splits = requested_num_kv_splits == 0 or (
         requested_num_kv_splits == 1 and _splitk_dtype_ok and not _gappy
     )
+    if _auto_splits and not _splitk_dtype_ok:
+        # Split-K is D=64/128 bf16/f16 only; leave the rest unsplit.
+        requested_num_kv_splits = 1
+        _auto_splits = False
 
     if varlen and not _varlen_uniform_q and requested_num_kv_splits > 1:
         raise NotImplementedError(
@@ -1242,7 +1259,8 @@ def _flydsl_flash_attn_paged(
 
     splitk = num_kv_splits > 1
     max_pages_per_split = (max_kv_pages + int(num_kv_splits) - 1) // int(num_kv_splits)
-    if max_pages_per_split > _PAGED_BT_LDS_SIZE:
+    # Only dualwave stages the block table in LDS.
+    if not _paged_light_ok and max_pages_per_split > _PAGED_BT_LDS_SIZE:
         max_supported_kv = _PAGED_BT_LDS_SIZE * int(num_kv_splits) * page_size
         raise NotImplementedError(
             f"flydsl_flash_attn_func: paged KV length {skv} exceeds block-table LDS window "
@@ -1309,6 +1327,7 @@ def _flydsl_flash_attn_paged(
                     block_m=128 if (_gqa_packed and Sq > 64) else 0,
                     window_left=window_left,
                     num_kv_splits=int(num_kv_splits),
+                    page_size=page_size,
                 )
             else:
                 exe = _build_paged(
@@ -1439,6 +1458,7 @@ def _build_paged_light(
     kv_lens: bool = False,
     block_m: int = 0,
     window_left: int = -1,
+    page_size: int = _PAGED_PAGE_SIZE,
 ):
     """Build a lightweight paged-varlen launcher for short attention.
 
@@ -1473,6 +1493,7 @@ def _build_paged_light(
         q_pack_group=q_pack_group,
         kv_lens=kv_lens,
         num_kv_splits=num_kv_splits,
+        page_size=page_size,
     )
 
 

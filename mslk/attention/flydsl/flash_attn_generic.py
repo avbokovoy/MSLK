@@ -86,6 +86,7 @@ def build_flash_attn_func_module_primary(
     q_pack_qlen=0,
     q_pack_group=0,
     kv_lens=False,
+    page_size=None,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
@@ -140,6 +141,7 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            page_size=page_size,
         )
         _launcher_m256 = build_flash_attn_func_module_primary(
             num_heads,
@@ -169,6 +171,7 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            page_size=page_size,
         )
         _bs_threshold = (
             2048 * num_heads if gpu_arch.startswith("gfx942") else 4096 * num_heads
@@ -270,6 +273,7 @@ def build_flash_attn_func_module_primary(
         q_pack_qlen=q_pack_qlen,
         q_pack_group=q_pack_group,
         kv_lens=kv_lens,
+        page_size=page_size,
     )
     _flash_attn_generic_cache_tag = (traits.cache_tag, COMBINE_PREFETCH)
 
@@ -1085,6 +1089,7 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            page_size=page_size,
         )
         _launch_mask = build_flash_attn_func_module_primary(
             num_heads,
@@ -1114,6 +1119,7 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            page_size=page_size,
         )
 
         def _pad_dispatch(*args, **kwargs):

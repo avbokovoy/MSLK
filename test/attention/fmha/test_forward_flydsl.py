@@ -12,11 +12,14 @@ decline / xfail policy.
 """
 
 import pytest
+import torch
+from mslk.attention import fmha
 from mslk.attention.fmha import flydsl
+from mslk.flydsl.common import is_flydsl_available
 
 from .case_generation import _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
 from .test_forward import test_forward as _stock_test_forward
-from .utils import rocm_only, UNSUPPORTED_OP_PASSES
+from .utils import assert_allclose, rocm_only, UNSUPPORTED_OP_PASSES
 
 _gen = _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv([flydsl.FwOp])
 _ARGVALUES = [(*v, False, "BMHK") for v in _gen["argvalues"]]
@@ -57,3 +60,85 @@ def test_forward_flydsl(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt):
                 "multi-KV-tile softmax (kernel numerics sound; see docstring)"
             )
         raise
+
+
+def _paged_reference(q, k, v, mask, scale):
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k.float()) * scale + mask
+    probs = torch.nan_to_num(scores.softmax(-1))  # fully-masked rows -> 0
+    return torch.einsum("bhqk,bkhd->bqhd", probs, v.float())
+
+
+@rocm_only
+@pytest.mark.parametrize(
+    "paged_type",
+    [
+        fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask,
+        fmha.attn_bias.PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
+        fmha.attn_bias.PagedBlockDiagonalGappyKeysMask,
+    ],
+    ids=lambda t: t.__name__,
+)
+@pytest.mark.parametrize("decode", [True, False], ids=["decode", "prefill"])
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64, 128])
+def test_forward_flydsl_paged(paged_type, decode: bool, D: int, page_size: int):
+    """Paged KV at page sizes below, at and above the kernel's 64-row tile."""
+    op = flydsl.FwOp
+    if not is_flydsl_available():
+        pytest.skip("FlyDSL is not available")
+    torch.manual_seed(0)
+    dtype, H = torch.bfloat16, 4
+    gappy = paged_type is fmha.attn_bias.PagedBlockDiagonalGappyKeysMask
+    # KV lengths straddle page boundaries; one sequence has no keys.
+    if decode:
+        q_lens, kv_lens = [1] * 5, [1, 15, 100, 300, 0]
+    else:
+        q_lens, kv_lens = [5, 64, 100, 3], [70, 64, 260, 3]
+    B = len(q_lens)
+    # Room for gappy sequences that start mid-page.
+    padding = -(-(max(kv_lens) + (64 if gappy else 0)) // page_size) * page_size
+    q = torch.randn([1, sum(q_lens), H, D], device="cuda", dtype=dtype)
+    k = torch.randn([1, B * padding, H, D], device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+
+    if gappy:
+        starts = [i * padding + s for i, s in enumerate([7, 0, 33, 1, 5][:B])]
+        bias = fmha.attn_bias.BlockDiagonalGappyKeysMask.from_seqlens(
+            q_lens, starts + [B * padding], kv_lens
+        )
+    elif paged_type is fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask:
+        bias = fmha.attn_bias.BlockDiagonalPaddedKeysMask.from_seqlens(
+            q_lens, padding, kv_lens
+        )
+    else:
+        bias = fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
+            q_seqlen=q_lens, kv_padding=padding, kv_seqlen=kv_lens
+        )
+
+    # Scatter the logical pages to shuffled physical pages.
+    num_pages = B * padding // page_size
+    perm = torch.randperm(num_pages, device="cuda")
+    k_pages = torch.empty([num_pages, page_size, H, D], device="cuda", dtype=dtype)
+    v_pages = torch.empty_like(k_pages)
+    k_pages[perm] = k.view(num_pages, page_size, H, D)
+    v_pages[perm] = v.view(num_pages, page_size, H, D)
+    block_tables = perm.view(B, padding // page_size).to(torch.int32)
+    if gappy:
+        paged_bias = bias.make_paged(block_tables, page_size, padding, paged_type)
+    else:
+        paged_bias = bias.make_paged(block_tables, page_size, paged_type)
+
+    out = fmha.memory_efficient_attention_forward(
+        q,
+        k_pages.view(1, -1, H, D),
+        v_pages.view(1, -1, H, D),
+        paged_bias,
+        op=op,
+    )
+    mask = bias.materialize(
+        (1, H, q.shape[1], k.shape[1]), device="cuda", dtype=torch.float32
+    )
+    ref = _paged_reference(q, k, v, mask, D**-0.5)
+    assert_allclose(
+        out.float(), ref, atol=op.ERROR_ATOL[dtype], rtol=op.ERROR_RTOL[dtype]
+    )
