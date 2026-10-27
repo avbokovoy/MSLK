@@ -29,12 +29,11 @@ non-unit D stride) remain unsupported.
 Non-goals (intentionally excluded rather than left as silent gaps -- each
 entry below is enforced generically, see the cited mechanism, and has its own
 negative-path test in `test_backward.py`):
-- Dropout off gfx950, on varlen/padded/paged inputs, or under graph capture:
-  the backward regenerates the forward's CK-compatible Philox keep-mask
-  (`mslk.attention.flydsl.dropout_philox`) from `ctx.rng_state` in the gfx950
-  fused kernel only; rejected via `_dropout_bwd_reasons()`. `flydsl.FwOp` pins
-  this op as the backward of a training-mode dropout forward and declines the
-  same inputs. Off gfx950, `ck.BwOp` accepts the same `rng_state`.
+- Dropout off gfx950 or on varlen/padded/paged inputs: only the gfx950 fused
+  kernel regenerates the forward's in-kernel Philox keep bits
+  (`mslk.attention.flydsl.dropout_philox`) from the seed in `ctx.rng_state`;
+  rejected via `_dropout_bwd_reasons()`. `flydsl.FwOp` pins this op as the
+  backward of a training-mode dropout forward and declines the same inputs.
 - True 5D BMGHK (`d.query.ndim == 5`, multi-query-group layout distinct from
   GQA-via-4D-broadcast, which IS supported): no MSLK caller found; rejected
   generically by the same `not_supported_reasons()`'s
@@ -219,10 +218,6 @@ def _dropout_bwd_reasons(d: Inputs) -> List[str]:
         + _PAGED_GAPPY_TYPES,
     ):
         reasons.append("dropout backward supports dense inputs only")
-    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-        # The forward takes its Philox seed/offset on the host, which a captured
-        # graph would freeze; capture keeps the forward-only torch RNG mask.
-        reasons.append("dropout with gradients is not supported under graph capture")
     return reasons
 
 
@@ -359,8 +354,7 @@ class FwOp(AttentionFwOpBase):
         )
         if _needs_grad and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
             reasons.append("native paged KV does not support gradients (no backward)")
-        # Training-mode dropout pins its backward to flydsl.BwOp (it regenerates
-        # the Philox mask from rng_state), so decline whatever that op cannot serve.
+        # Training-mode dropout pins flydsl.BwOp; decline what it cannot serve.
         if _needs_grad and d.p != 0.0:
             reasons.extend(
                 f"dropout backward (flydsl.BwOp): {r}"
@@ -494,40 +488,18 @@ class FwOp(AttentionFwOpBase):
 
         kw["return_lse"] = needs_gradient
 
-        # Dropout (dense only): a uint8 keep-mask (0/1); the 1/(1-p) inverted-
-        # dropout scale is applied to the output in _run (a constant factor, so it
-        # factors out of the per-(q,k) sum). The mask is CK's Philox mask, so the
-        # backward regenerates it from rng_state. Under graph capture the host-side
-        # seed/offset would be frozen into the graph, so capture keeps a torch RNG
-        # mask that advances per replay (forward-only; training is declined).
+        # Dropout (dense only): the kernel draws the keep bits in-kernel from a
+        # per-call device seed (dropout_philox), and the backward regenerates them
+        # from the same seed, kept as rng_state. The 1/(1-p) inverted-dropout scale
+        # is applied to the output in _run (a constant factor, so it factors out of
+        # the per-(q,k) sum).
         rng_state = None
         if inp.p != 0.0:
-            B = inp.query.shape[0]
-            Sq = inp.query.shape[1]
-            H = inp.query.shape[2]
-            Skv = inp.key.shape[1]
-            device = inp.query.device
-            if torch.cuda.is_current_stream_capturing():
-                keep = (
-                    torch.rand(B, H, Sq, Skv, device=device, dtype=torch.float32)
-                    >= inp.p
-                ).to(torch.uint8)
-            else:
-                from mslk.attention.flydsl.dropout_philox import (
-                    philox_dropout_keep_mask,
-                    reserve_philox_seed_offset,
-                )
+            from mslk.attention.flydsl.dropout_philox import draw_dropout_seed
 
-                seed, offset = reserve_philox_seed_offset(device, B, H, Sq, Skv)
-                keep = philox_dropout_keep_mask(
-                    B, H, Sq, Skv, inp.p, seed, offset, device
-                )
-                # ck.BwOp's format: CPU int64 [seed, offset] (bit pattern).
-                rng_state = torch.tensor(
-                    [x - (1 << 64) if x >= 1 << 63 else x for x in (seed, offset)],
-                    dtype=torch.int64,
-                )
-            kw["dropout_mask"] = keep
+            rng_state = draw_dropout_seed(inp.query.device)
+            kw["dropout_p"] = inp.p
+            kw["dropout_seed"] = rng_state
 
         # Shared tail: pad the head dim, call, unpack LSE, slice padded columns off O,
         # restore input shape (slice/reshape are no-ops when a path didn't pad).
@@ -701,15 +673,9 @@ class FwOp(AttentionFwOpBase):
             # yet wired as the default: the flydsl FwOp+BwOp pair diverges for
             # f16 (never tested together upstream) and needs numerical
             # verification before it can be preferred here. Dropout is the
-            # exception: only flydsl.BwOp regenerates the mask on gfx950.
+            # exception: only flydsl.BwOp regenerates this forward's mask.
             ctx = Context(lse=lse, out=out, op_bw=BwOp if inp.p != 0.0 else None)
-            if inp.p != 0.0:
-                if rng_state is None:
-                    raise NotImplementedError(
-                        "flydsl dropout with gradients is not supported under "
-                        "graph capture"
-                    )
-                ctx.rng_state = rng_state
+            ctx.rng_state = rng_state
         return out, ctx
 
 
@@ -842,7 +808,7 @@ def _flydsl_bwd(
     attn_bias: Optional[torch.Tensor] = None,
     needs_dbias: bool = False,
     window_left: int = -1,
-    dropout_mask: Optional[torch.Tensor] = None,
+    dropout_seed: Optional[torch.Tensor] = None,
     dropout_p: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # pyre-ignore[21]: FlyDSL is available only in AMD builds.
@@ -979,20 +945,22 @@ def _flydsl_bwd(
         )
     _dummy_bias = torch.zeros(1, device=device, dtype=dtype)
     _bias_arg = attn_bias if has_bias else _dummy_bias
-    # Dropout: the forward's [B, H, M, N] uint8 keep-mask, regenerated by the caller
-    # from rng_state. Dense gfx950 only (BwOp declines the rest).
-    has_dropout = dropout_mask is not None
+    # Dropout: the kernel regenerates the forward's keep bits from its device seed
+    # (the forward's rng_state). Dense gfx950 only (BwOp declines the rest).
+    has_dropout = dropout_seed is not None
     if has_dropout and (not _is_gfx950 or varlen):
         raise NotImplementedError(
             "mslk_flydsl::fmha_bwd implements dropout for dense inputs on gfx950 only"
         )
     if has_dropout:
-        _dropout_arg = dropout_mask
-        dropout_strides = tuple(dropout_mask.stride()[:3])
+        from mslk.attention.flydsl.dropout_philox import dropout_drop_threshold
+
+        _dropout_arg = dropout_seed
+        dropout_threshold = dropout_drop_threshold(dropout_p)
         dropout_rp = 1.0 / (1.0 - dropout_p)
     else:
-        _dropout_arg = torch.zeros(1, device=device, dtype=torch.uint8)
-        dropout_strides = (0, 0, 0)
+        _dropout_arg = torch.zeros(1, device=device, dtype=torch.int64)
+        dropout_threshold = 0
         dropout_rp = 1.0
     if attn_bias is not None:
         bias_stride_b = attn_bias.stride(0)
@@ -1059,7 +1027,7 @@ def _flydsl_bwd(
             dBias_out,
             dbias_sink,
             _dropout_arg,
-            *dropout_strides,
+            dropout_threshold,
             dropout_rp,
             stream,
         )
@@ -1133,7 +1101,7 @@ def _flydsl_bwd(
                 torch.zeros_like(dBias_out),
                 dbias_sink,
                 _dropout_arg,
-                *dropout_strides,
+                dropout_threshold,
                 dropout_rp,
                 stream,
             )
@@ -1484,7 +1452,7 @@ def _flydsl_bwd_abstract(
     attn_bias: Optional[torch.Tensor] = None,
     needs_dbias: bool = False,
     window_left: int = -1,
-    dropout_mask: Optional[torch.Tensor] = None,
+    dropout_seed: Optional[torch.Tensor] = None,
     dropout_p: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # db is empty (not None) when no bias gradient was requested: the schema's
@@ -1655,19 +1623,9 @@ class BwOp(AttentionBwOpBase):
             if isinstance(inp.attn_bias, _WINDOW_BIAS_TYPES)
             else -1
         )
-        dropout_mask = None
-        if inp.p != 0.0:
-            # Regenerate the forward's keep-mask from its Philox rng_state.
-            if ctx.rng_state is None:
-                raise NotImplementedError(
-                    "flydsl.BwOp dropout needs the forward's rng_state"
-                )
-            from mslk.attention.flydsl.dropout_philox import philox_dropout_keep_mask
-
-            seed, offset = (int(x) & 0xFFFFFFFFFFFFFFFF for x in ctx.rng_state.tolist())
-            B, M, H = inp.query.shape[:3]
-            dropout_mask = philox_dropout_keep_mask(
-                B, H, M, inp.key.shape[1], inp.p, seed, offset, inp.query.device
+        if inp.p != 0.0 and ctx.rng_state is None:
+            raise NotImplementedError(
+                "flydsl.BwOp dropout needs the forward's rng_state"
             )
         dq, dk, dv, db = cls.OPERATOR(
             inp.query,
@@ -1683,7 +1641,7 @@ class BwOp(AttentionBwOpBase):
             bias_t,
             needs_dbias,
             window_left,
-            dropout_mask,
+            ctx.rng_state if inp.p != 0.0 else None,
             inp.p,
         )
         # GQA-via-broadcast (`key`/`value` genuinely Hkv-headed, exposed to

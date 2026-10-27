@@ -63,9 +63,7 @@ def test_forward_flydsl(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt):
 
 @rocm_only
 def test_forward_flydsl_declines_dropout_gradients():
-    # Training-mode dropout pins flydsl.BwOp, so the forward must decline inputs
-    # that backward cannot serve (here head_dim 48, not a multiple of 32) before
-    # dispatch instead of failing in the backward.
+    # flydsl.BwOp rejects head_dim 48, so training-mode dropout must decline.
     q = torch.randn([2, 64, 4, 48], device="cuda", dtype=torch.bfloat16)
     reason = "dropout backward (flydsl.BwOp): head_dim must be a multiple of 32"
     assert reason not in flydsl.FwOp.not_supported_reasons(fmha.Inputs(q, q, q, p=0.3))

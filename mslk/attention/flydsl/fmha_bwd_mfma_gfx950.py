@@ -17,6 +17,12 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw, ArithValue
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from mslk.attention.flydsl.dropout_philox import (
+    dropout_random_words,
+    keep_flag,
+    load_dropout_key,
+    select_word,
+)
 from mslk.attention.flydsl.fmha_bwd_mfma import (
     _ds_read_tr_v4,
     _grad_ds_unscaled,
@@ -30,6 +36,10 @@ from mslk.attention.flydsl.fmha_bwd_mfma import (
 )
 
 _GFX950_LDS_BYTES = 160 * 1024
+
+
+def _mulf(a, b, fm):
+    return fx.Float32(arith.mulf(_raw(a), _raw(b), fastmath=fm))
 
 
 def gfx950_lds_bytes(
@@ -394,9 +404,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         dBias: fx.Tensor,
         dbias_sink: fx.Int32,
         Dropout: fx.Tensor,
-        dropout_stride_b: fx.Int32,
-        dropout_stride_h: fx.Int32,
-        dropout_stride_q: fx.Int32,
+        dropout_threshold: fx.Int32,
         dropout_rp: fx.Float32,
     ):
         bid = fx.block_idx.x
@@ -592,14 +600,11 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             bias_plane_base = batch_idx * fx.Index(bias_stride_b) + head_idx * fx.Index(
                 bias_stride_h
             )
-        # Dropout keep-mask [B, H, Mq, Mk] uint8 (0/1), regenerated host-side from the
-        # forward's rng_state. P' = P * keep * rp feeds dV and dP' = dP * keep * rp
-        # feeds dS; D = rowsum(dO * O) already includes the dropout.
+        # Dropout: regenerate the forward's keep bits. P * keep * rp feeds dV and
+        # dP * keep * rp feeds dS; D = rowsum(dO * O) already includes dropout.
         if const_expr(has_dropout):
-            drop_rsrc = _bops.create_buffer_resource(Dropout)
-            drop_plane_base = batch_idx * fx.Index(
-                dropout_stride_b
-            ) + head_idx * fx.Index(dropout_stride_h)
+            drop_key = load_dropout_key(Dropout)
+            drop_bh = batch_idx * n_heads_idx + head_idx
         # dL/dBias is dL/dS_total, i.e. the UNSCALED dS below -- scale belongs only to
         # the dQ/dK GEMMs. One writer per element, so no atomics and no reduction.
         if const_expr(emit_dbias):
@@ -1636,35 +1641,19 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                             _epi_p_vals[(n_grp, m_half, r)] = p_val
                                             _epi_valids[(n_grp, m_half, r)] = valid_mn
                                             if const_expr(has_dropout):
-                                                d_off = (
-                                                    drop_plane_base
-                                                    + fx.Index(m_row_abs)
-                                                    * fx.Index(dropout_stride_q)
-                                                    + fx.Index(n_row_abs)
+                                                n_idx = fx.Index(n_row_abs)
+                                                words = dropout_random_words(
+                                                    drop_key,
+                                                    drop_bh,
+                                                    fx.Index(m_row_abs),
+                                                    n_idx,
                                                 )
-                                                # Same in-bounds redirect as the
-                                                # bias load above.
-                                                keep_byte = _bops.buffer_load(
-                                                    drop_rsrc,
-                                                    bias_load_valid.select(
-                                                        fx.Index(d_off), fx.Index(0)
-                                                    ),
-                                                    vec_width=1,
-                                                    dtype=fx.Int8,
-                                                )
-                                                keep_rp = fx.Float32(
-                                                    arith.mulf(
-                                                        _raw(
-                                                            fx.Uint8(keep_byte).to(
-                                                                fx.Float32
-                                                            )
-                                                        ),
-                                                        _raw(dropout_rp),
-                                                        fastmath=fm,
-                                                    )
+                                                keep = keep_flag(
+                                                    select_word(words, n_idx),
+                                                    dropout_threshold,
                                                 )
                                                 _epi_keep_rp[(n_grp, m_half, r)] = (
-                                                    keep_rp
+                                                    _mulf(keep, dropout_rp, fm)
                                                 )
                                         else:
                                             p_val = _epi_p_vals[(n_grp, m_half, r)]
@@ -1673,16 +1662,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                             dm_val = Vec(dm_grp)[r]
                                             dp_val = Vec(dp_accs[ai])[r]
                                             if const_expr(has_dropout):
-                                                dp_val = fx.Float32(
-                                                    arith.mulf(
-                                                        _raw(dp_val),
-                                                        _raw(
-                                                            _epi_keep_rp[
-                                                                (n_grp, m_half, r)
-                                                            ]
-                                                        ),
-                                                        fastmath=fm,
-                                                    )
+                                                dp_val = _mulf(
+                                                    dp_val,
+                                                    _epi_keep_rp[(n_grp, m_half, r)],
+                                                    fm,
                                                 )
                                             ds_val = _grad_ds_unscaled(
                                                 p_val, dp_val, dm_val, valid_mn, fm
@@ -1697,16 +1680,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                         if const_expr(_epi_do_p):
                                             p_dv = p_val
                                             if const_expr(has_dropout):
-                                                p_dv = fx.Float32(
-                                                    arith.mulf(
-                                                        _raw(p_val),
-                                                        _raw(
-                                                            _epi_keep_rp[
-                                                                (n_grp, m_half, r)
-                                                            ]
-                                                        ),
-                                                        fastmath=fm,
-                                                    )
+                                                p_dv = _mulf(
+                                                    p_val,
+                                                    _epi_keep_rp[(n_grp, m_half, r)],
+                                                    fm,
                                                 )
                                             fx.memref_store(
                                                 Vec.from_elements(
@@ -2179,9 +2156,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         dBias: fx.Tensor,
         dbias_sink: fx.Int32,
         Dropout: fx.Tensor,
-        dropout_stride_b: fx.Int32,
-        dropout_stride_h: fx.Int32,
-        dropout_stride_q: fx.Int32,
+        dropout_threshold: fx.Int32,
         dropout_rp: fx.Float32,
         stream: fx.Stream,
     ):
@@ -2228,9 +2203,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             dBias,
             dbias_sink,
             Dropout,
-            dropout_stride_b,
-            dropout_stride_h,
-            dropout_stride_q,
+            dropout_threshold,
             dropout_rp,
         ).launch(
             grid=(grid_x, 1, 1),

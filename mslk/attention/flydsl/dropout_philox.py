@@ -5,46 +5,37 @@
 # LICENSE file in the root directory of this source tree.
 # pyre-unsafe
 
-"""CK-compatible Philox dropout keep-mask for the FlyDSL attention kernels.
+"""In-kernel Philox dropout shared by the FlyDSL forward and backward kernels.
 
-The mask is a pure function of (seed, offset, batch, head, q_row, kv_col), the
-same one CK's fmha kernels use (ck_tile philox_rand.hpp and
-host/reference/reference_batched_dropout_randval.hpp):
-
-* P is split into 32x32 tiles. Tile (tm, tn) of head h in batch b draws 64
-  Philox4x32 (7 rounds) results with counter = (offset + (b * H + h) * 64 + lane,
-  subsequence = tm | tn << 32) and key = seed.
-* Byte r of lane `lane` is the random value at row 16 * (r // 8) + 8 * (lane // 32)
-  + r % 8 and column lane % 32 of the tile.
-* An element is kept when its byte <= floor((1 - p) * 255); kept values are
-  scaled by 1 / (1 - p).
-
-Because the mask depends only on (seed, offset), a backward regenerates exactly
-the forward's mask, and CK's backward accepts the same rng_state.
+The mask is never stored; both kernels derive the keep bit of P[b, h, m, n]:
+Philox4x32-10 (as triton.language.random) with key = seed and counter =
+(n // 4, m, b * H + h, 0), H = query heads. Word n % 4 is the random value; keep
+if it is >= round(p * 2**32). The seed is a device int64[1] tensor, so neither
+side syncs with the host and CUDA graph replays draw fresh masks.
 """
 
-import functools
-from typing import Tuple
-
-import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import range_constexpr
 from mslk.flydsl import buffer_ops
 
-PHILOX_W0 = 0x9E3779B9
-PHILOX_W1 = 0xBB67AE85
-PHILOX_M0 = 0xD2511F53
-PHILOX_M1 = 0xCD9E8D57
-PHILOX_ROUNDS = 7
-# Philox results per 32x32 tile of P (64 lanes x 16 bytes).
-PHILOX_PER_TILE = 64
-_BLOCK = 256
+PHILOX_KEY_A = 0x9E3779B9
+PHILOX_KEY_B = 0xBB67AE85
+PHILOX_ROUND_A = 0xD2511F53
+PHILOX_ROUND_B = 0xCD9E8D57
+PHILOX_ROUNDS = 10
+# Consecutive columns of a row that share one Philox call.
+DROPOUT_COLS_PER_CALL = 4
 
 
-def philox_keep_threshold(p: float) -> int:
-    """Largest random byte that keeps an element (CK's p_undrop_in_uint8_t)."""
-    return int((1.0 - p) * 255.0 // 1)
+def dropout_drop_threshold(p: float) -> int:
+    """Random words below this are dropped: round(p * 2**32), as an i32 bit pattern."""
+    thr = min(int(round(p * 2**32)), 2**32 - 1)
+    return thr - 2**32 if thr >= 2**31 else thr
+
+
+def draw_dropout_seed(device: torch.device) -> torch.Tensor:
+    """Fresh per-call Philox seed as a device int64[1] tensor (graph-capture safe)."""
+    return torch.randint(0, 2**62, (1,), dtype=torch.int64, device=device)
 
 
 def _mulhilo(a, b):
@@ -53,161 +44,51 @@ def _mulhilo(a, b):
 
 
 def philox_4x32(c0, c1, c2, c3, k0, k1):
-    """ck_tile::philox::get_philox_4x32 on Uint32 values."""
+    """Philox4x32-10 on Uint32 values (matches triton.language.random.philox)."""
     for i in range(PHILOX_ROUNDS):
-        hi0, lo0 = _mulhilo(fx.Uint32(PHILOX_M0), c0)
-        hi1, lo1 = _mulhilo(fx.Uint32(PHILOX_M1), c2)
+        hi0, lo0 = _mulhilo(fx.Uint32(PHILOX_ROUND_A), c0)
+        hi1, lo1 = _mulhilo(fx.Uint32(PHILOX_ROUND_B), c2)
         c0, c1, c2, c3 = hi1 ^ c1 ^ k0, lo1, hi0 ^ c3 ^ k1, lo0
         if i < PHILOX_ROUNDS - 1:
-            k0 = k0 + fx.Uint32(PHILOX_W0)
-            k1 = k1 + fx.Uint32(PHILOX_W1)
+            k0 = k0 + fx.Uint32(PHILOX_KEY_A)
+            k1 = k1 + fx.Uint32(PHILOX_KEY_B)
     return c0, c1, c2, c3
 
 
-@functools.lru_cache(maxsize=None)
-def _build_keep_mask_launcher():
-    @flyc.kernel(known_block_size=[_BLOCK, 1, 1])
-    def philox_keep_mask_kernel(
-        Mask: fx.Tensor,  # [B * H * M * N] uint8 keep-mask (0/1)
-        n_items: fx.Int32,  # B * H * tiles_m * tiles_n * 64
-        seqlen_q: fx.Int32,
-        seqlen_k: fx.Int32,
-        mask_bytes: fx.Int32,
-        seed_lo: fx.Int32,
-        seed_hi: fx.Int32,
-        offset_lo: fx.Int32,
-        offset_hi: fx.Int32,
-        threshold: fx.Int32,
-    ):
-        idx = fx.Index(fx.block_idx.x) * _BLOCK + fx.Index(fx.thread_idx.x)
-        if idx < fx.Index(n_items):
-            tiles_m = (fx.Index(seqlen_q) + 31) // 32
-            tiles_n = (fx.Index(seqlen_k) + 31) // 32
-            lane = idx % PHILOX_PER_TILE
-            t = idx // PHILOX_PER_TILE
-            tn = t % tiles_n
-            t = t // tiles_n
-            tm = t % tiles_m
-            bh = t // tiles_m
-            offset = (fx.Uint32(offset_hi).to(fx.Uint64) << 32) | fx.Uint32(
-                offset_lo
-            ).to(fx.Uint64)
-            ctr = offset + fx.Uint64(fx.Int64(bh * PHILOX_PER_TILE + lane))
-            words = philox_4x32(
-                ctr.to(fx.Uint32),
-                (ctr >> 32).to(fx.Uint32),
-                fx.Uint32(fx.Int32(tm)),
-                fx.Uint32(fx.Int32(tn)),
-                fx.Uint32(seed_lo),
-                fx.Uint32(seed_hi),
-            )
-            # Exact-size resource: masked-off (out-of-tile) stores are dropped.
-            rsrc = buffer_ops.create_buffer_resource(
-                Mask, max_size=False, num_records_bytes=fx.Int32(mask_bytes)
-            )
-            col = tn * 32 + lane % 32
-            row_base = tm * 32 + (lane // 32) * 8
-            thr = fx.Uint32(threshold)
-            for r in range_constexpr(16):
-                rand = (words[r // 4] >> ((r % 4) * 8)) & fx.Uint32(0xFF)
-                keep = (rand <= thr).select(fx.Int32(1), fx.Int32(0))
-                row = row_base + (16 * (r // 8) + r % 8)
-                valid = (row < fx.Index(seqlen_q)) & (col < fx.Index(seqlen_k))
-                off = (bh * fx.Index(seqlen_q) + row) * fx.Index(seqlen_k) + col
-                buffer_ops.buffer_store(
-                    keep.to(fx.Int8), rsrc, fx.Int32(off), mask=valid
-                )
-
-    @flyc.jit
-    def launch(
-        Mask: fx.Tensor,
-        n_items: fx.Int32,
-        seqlen_q: fx.Int32,
-        seqlen_k: fx.Int32,
-        mask_bytes: fx.Int32,
-        seed_lo: fx.Int32,
-        seed_hi: fx.Int32,
-        offset_lo: fx.Int32,
-        offset_hi: fx.Int32,
-        threshold: fx.Int32,
-        stream: fx.Stream,
-    ):
-        n_blocks = (fx.Index(n_items) + _BLOCK - 1) // _BLOCK
-        philox_keep_mask_kernel(
-            Mask,
-            n_items,
-            seqlen_q,
-            seqlen_k,
-            mask_bytes,
-            seed_lo,
-            seed_hi,
-            offset_lo,
-            offset_hi,
-            threshold,
-        ).launch(grid=(fx.Int32(n_blocks), 1, 1), block=(_BLOCK, 1, 1), stream=stream)
-
-    return launch
+def load_dropout_key(seed_tensor):
+    """In-kernel: the (lo, hi) Uint32 Philox key from the int64[1] seed tensor."""
+    rsrc = buffer_ops.create_buffer_resource(seed_tensor)
+    lo = buffer_ops.buffer_load(rsrc, 0, vec_width=1, dtype=fx.Int32)
+    hi = buffer_ops.buffer_load(rsrc, 1, vec_width=1, dtype=fx.Int32)
+    return fx.Uint32(lo), fx.Uint32(hi)
 
 
-def _split_u64(v: int) -> Tuple[int, int]:
-    # Kernel args are i32; pass the two's-complement halves.
-    lo, hi = v & 0xFFFFFFFF, (v >> 32) & 0xFFFFFFFF
-    return tuple(x - (1 << 32) if x >= (1 << 31) else x for x in (lo, hi))
+def _u32(index):
+    return fx.Uint32(fx.Int32(index))
 
 
-def philox_dropout_keep_mask(
-    batch: int,
-    heads: int,
-    seqlen_q: int,
-    seqlen_k: int,
-    p: float,
-    seed: int,
-    offset: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """uint8 [batch, heads, seqlen_q, seqlen_k] keep-mask (1 = keep)."""
-    mask = torch.empty(
-        (batch, heads, seqlen_q, seqlen_k), dtype=torch.uint8, device=device
+def dropout_random_words(key, bh, row, col):
+    """In-kernel: random words for columns 4*(col//4) .. 4*(col//4)+3 of a row."""
+    return philox_4x32(
+        _u32(col // DROPOUT_COLS_PER_CALL),
+        _u32(row),
+        _u32(bh),
+        fx.Uint32(0),
+        key[0],
+        key[1],
     )
-    if mask.numel() == 0:
-        return mask
-    if mask.numel() >= 1 << 31:
-        raise ValueError(
-            "philox_dropout_keep_mask: the keep-mask must hold < 2**31 elements, "
-            f"got {mask.numel()}"
-        )
-    tiles = ((seqlen_q + 31) // 32) * ((seqlen_k + 31) // 32)
-    seed_lo, seed_hi = _split_u64(seed)
-    offset_lo, offset_hi = _split_u64(offset)
-    with torch.cuda.device(device):
-        _build_keep_mask_launcher()(
-            mask.view(-1),
-            batch * heads * tiles * PHILOX_PER_TILE,
-            seqlen_q,
-            seqlen_k,
-            mask.numel(),
-            seed_lo,
-            seed_hi,
-            offset_lo,
-            offset_hi,
-            philox_keep_threshold(p),
-            torch.cuda.current_stream(device),
-        )
-    return mask
 
 
-def reserve_philox_seed_offset(
-    device: torch.device, batch: int, heads: int, seqlen_q: int, seqlen_k: int
-) -> Tuple[int, int]:
-    """Draw (seed, offset) from the device's default generator like CK does.
+def select_word(words, col):
+    """In-kernel: word col % 4 of a dropout_random_words result."""
+    i = col % DROPOUT_COLS_PER_CALL
+    word = words[0]
+    for w in range(1, DROPOUT_COLS_PER_CALL):
+        word = (i == fx.Index(w)).select(words[w], word)
+    return word
 
-    Mirrors the CK forward's gen->philox_cuda_state((B + 3) * (H + 1) * (M + 1) *
-    (N + 1)) so FlyDSL and CK dropout calls never reuse each other's counters.
-    """
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    gen = torch.cuda.default_generators[index]
-    increment = (batch + 3) * (heads + 1) * (seqlen_q + 1) * (seqlen_k + 1)
-    increment = (increment + 3) // 4 * 4  # CUDAGeneratorImpl rounds to 4
-    seed, offset = gen.initial_seed(), gen.get_offset()
-    gen.set_offset(offset + increment)
-    return seed, offset
+
+def keep_flag(word, threshold):
+    """In-kernel: 1.0 if the element survives dropout, else 0.0 (Float32)."""
+    keep = word >= fx.Uint32(threshold)
+    return keep.select(fx.Float32(1.0), fx.Float32(0.0))

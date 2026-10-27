@@ -45,6 +45,7 @@ import torch
 import torch.nn.functional as F  # noqa: F401  (imported for callers' convenience)
 
 # Re-export so callers only need to import from this module.
+from .dropout_philox import dropout_drop_threshold
 from .flash_attn_utils import dualwave_splitk_workspace_elems
 
 __all__ = ["flydsl_flash_attn_func", "dualwave_splitk_workspace_elems"]
@@ -335,6 +336,15 @@ def _build_varlen(
         dualwave_swp_enable_stagger=enable_stagger,
         return_lse=return_lse,
     )
+
+
+def _dropout_kwargs(dropout_p: float, dropout_seed: Optional[torch.Tensor]) -> dict:
+    if dropout_seed is None:
+        return {}
+    return {
+        "dropout": dropout_seed,
+        "dropout_threshold": dropout_drop_threshold(dropout_p),
+    }
 
 
 @functools.lru_cache(maxsize=256)
@@ -1533,9 +1543,11 @@ def flydsl_flash_attn_func(
     bias: Optional[torch.Tensor] = None,
     # Top-left causal (kv_col <= q_row) vs default bottom-right; cross-length only.
     causal_top_left: bool = False,
-    # Dropout mask broadcastable to [B, H, Sq, Skv]; 0 or 1/(1-p), applied to post-
-    # softmax P.
-    dropout_mask: Optional[torch.Tensor] = None,
+    # Dropout (dense f16/bf16 only): drop probability and the device int64[1]
+    # Philox seed (mslk.attention.flydsl.dropout_philox). The kernel draws the
+    # keep bits in-kernel; the caller applies the 1/(1-p) output scale.
+    dropout_p: float = 0.0,
+    dropout_seed: Optional[torch.Tensor] = None,
     # CUDA/HIP stream; defaults to the current stream for q.device.
     stream: Optional[torch.cuda.Stream] = None,
 ):
@@ -1661,7 +1673,11 @@ def flydsl_flash_attn_func(
                 "flydsl_flash_attn_func: attention bias is only supported on the "
                 "dense f16/bf16 path (not fp8/paged/varlen)"
             )
-    if dropout_mask is not None:
+    if (dropout_p != 0.0) != (dropout_seed is not None):
+        raise ValueError(
+            "flydsl_flash_attn_func: dropout_p and dropout_seed must be set together"
+        )
+    if dropout_seed is not None:
         _varlen_req = cu_seqlens_q is not None
         if dtype_str == "fp8" or paged_kv or _varlen_req:
             raise NotImplementedError(
@@ -1810,6 +1826,10 @@ def flydsl_flash_attn_func(
                 f"flydsl_flash_attn_func: split-K requires D=64/128, dtype bf16/f16, seq_len>=384; "
                 f"got D={D}, dtype={dtype_str}, seq_len={Sq}"
             )
+        if dropout_seed is not None:
+            raise NotImplementedError(
+                "flydsl_flash_attn_func: dropout does not support split-K"
+            )
         ws_elems = dualwave_splitk_workspace_elems(
             B, H, Sq, int(num_kv_splits), head_dim=D
         )
@@ -1931,7 +1951,7 @@ def flydsl_flash_attn_func(
                 _windowed = window_left >= 0
                 _custom_scale = sm_scale is not None
                 _has_bias = bias is not None
-                _has_dropout = dropout_mask is not None
+                _has_dropout = dropout_seed is not None
                 if (
                     not _windowed
                     and not _custom_scale
@@ -2114,16 +2134,7 @@ def flydsl_flash_attn_func(
                     bias_stride_h=int(bias_e.stride(1)),
                     bias_stride_q=int(bias_e.stride(2)),
                 )
-            if dropout_mask is not None:
-                # Same ABI as bias: unit kv stride, broadcast to [B, H, Sq, Skv].
-                drop_e = dropout_mask.contiguous().expand(B, H, Sq, Skv)
-                assert drop_e.stride(3) == 1, "dropout kv axis must be unit-stride"
-                kwargs.update(
-                    dropout=drop_e,
-                    dropout_stride_b=int(drop_e.stride(0)),
-                    dropout_stride_h=int(drop_e.stride(1)),
-                    dropout_stride_q=int(drop_e.stride(2)),
-                )
+            kwargs.update(_dropout_kwargs(dropout_p, dropout_seed))
             if generic_splitk:
                 # Dense combine writes O in [B, Sq, H, D] layout (stride_q_n = H*D).
                 _ws = torch.empty(

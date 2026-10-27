@@ -6,98 +6,89 @@
 
 """Dropout tests for the FlyDSL attention ops.
 
-flydsl.FwOp draws CK's Philox dropout mask (mslk.attention.flydsl.dropout_philox)
-from a (seed, offset) reserved on the default generator exactly as CK's forward
-does, and stores it as rng_state. flydsl.BwOp regenerates the same mask from
-rng_state on gfx950, and since the mask is CK's, ck.BwOp accepts the same
-rng_state. Scoped to the op's dropout subset: dense self-attention
-(q_len == kv_len), f16/bf16, multiple heads, head_dim in {64, 128}.
+The reference mask is an independent Triton (tl.philox) implementation of the
+definition in mslk.attention.flydsl.dropout_philox.
 """
 
-import numpy as np
 import pytest
 import torch
+import triton
+import triton.language as tl
 from mslk.attention import fmha
-from mslk.attention.fmha.common import Context
 from scipy.stats import binomtest  # type: ignore
 
 from .test_mem_eff_attention import _vec_binom_test
 from .utils import assert_allclose, ref_attention_for_test, rocm_only
 
 
-def _generator_state():
-    gen = torch.cuda.default_generators[torch.cuda.current_device()]
-    return gen.initial_seed(), gen.get_offset()
+@triton.jit
+def _reference_keep_kernel(out_ptr, seed, total, M, N, threshold, BLOCK: tl.constexpr):
+    # keep[b, h, m, n]: word n % 4 of Philox4x32-10(key=seed,
+    # counter=(n // 4, m, b * H + h, 0)) >= threshold.
+    idx = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    n = idx % N
+    m = (idx // N) % M
+    bh = idx // N // M
+    c0 = (n // 4).to(tl.uint32)
+    r0, r1, r2, r3 = tl.philox(
+        seed, c0, m.to(tl.uint32), bh.to(tl.uint32), tl.zeros_like(c0)
+    )
+    word = n % 4
+    rand = tl.where(word == 0, r0, tl.where(word == 1, r1, tl.where(word == 2, r2, r3)))
+    keep = rand >= threshold.to(tl.uint32)
+    tl.store(out_ptr + idx, keep.to(tl.uint8), mask=idx < total)
 
 
-def _drop_mask(batch_size, num_heads, q_len, kv_len, p, seed, offset):
-    from mslk.attention.flydsl.dropout_philox import philox_dropout_keep_mask
+def _draw_seed():
+    from mslk.attention.flydsl.dropout_philox import draw_dropout_seed
 
-    keep = philox_dropout_keep_mask(
-        batch_size, num_heads, q_len, kv_len, p, seed, offset, torch.device("cuda")
+    return int(draw_dropout_seed(torch.device("cuda")).item())
+
+
+def _drop_mask(seed, batch_size, num_heads, q_len, kv_len, p):
+    keep = torch.empty(
+        (batch_size, num_heads, q_len, kv_len), dtype=torch.uint8, device="cuda"
+    )
+    threshold = min(round(p * 2**32), 2**32 - 1)
+    grid = (triton.cdiv(keep.numel(), 1024),)
+    _reference_keep_kernel[grid](
+        keep, seed, keep.numel(), q_len, kv_len, threshold, BLOCK=1024
     )
     return keep.to(torch.float32)
 
 
 def _keep_probability(p):
-    # CK keeps a random byte <= floor((1 - p) * 255), i.e. (threshold + 1) / 256.
-    from mslk.attention.flydsl.dropout_philox import philox_keep_threshold
-
-    return (philox_keep_threshold(p) + 1) / 256
+    return 1.0 - min(round(p * 2**32), 2**32 - 1) / 2**32
 
 
-def _ck_reference_randval(batch, heads, q_len, kv_len, seed, offset):
-    """Transcription of ck_tile/host/reference/reference_batched_dropout_randval.hpp."""
-    from mslk.attention.flydsl import dropout_philox as dp
-
-    m32 = 0xFFFFFFFF
-
-    def philox(counter_lo, subsequence):
-        c = [counter_lo & m32, counter_lo >> 32, subsequence & m32, subsequence >> 32]
-        k = [seed & m32, seed >> 32]
-        for _ in range(dp.PHILOX_ROUNDS):
-            p0, p1 = dp.PHILOX_M0 * c[0], dp.PHILOX_M1 * c[2]
-            c = [
-                ((p1 >> 32) ^ c[1] ^ k[0]) & m32,
-                p1 & m32,
-                ((p0 >> 32) ^ c[3] ^ k[1]) & m32,
-                p0 & m32,
-            ]
-            k = [(k[0] + dp.PHILOX_W0) & m32, (k[1] + dp.PHILOX_W1) & m32]
-        return np.array(c, dtype="<u4").view(np.uint8)
-
-    out = np.zeros((batch, heads, q_len, kv_len), dtype=np.uint8)
-    for b in range(batch):
-        for h in range(heads):
-            for tm in range((q_len + 31) // 32):
-                for tn in range((kv_len + 31) // 32):
-                    for lane in range(64):
-                        counter = (offset + (b * heads + h) * 64 + lane) & (2**64 - 1)
-                        rand = philox(counter, tm | tn << 32)
-                        for r in range(16):
-                            i = 16 * (r // 8) + 8 * (lane // 32) + r % 8
-                            m, n = tm * 32 + i, tn * 32 + lane % 32
-                            if m < q_len and n < kv_len:
-                                out[b, h, m, n] = rand[r]
-    return out
+def _is_gfx950():
+    return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
 
 
 @rocm_only
-@pytest.mark.parametrize(
-    "shape,seed,offset",
-    [
-        ((1, 1, 32, 32), 0, 0),
-        ((2, 3, 70, 45), 0x123456789ABCDEF0, 0xFFFFFF80),  # counter carries into hi
-        ((1, 2, 33, 64), 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFF00000040),
-    ],
-)
-@pytest.mark.parametrize("p", [0.1, 0.5])
-def test_philox_keep_mask_matches_ck(shape, seed, offset, p):
-    from mslk.attention.flydsl.dropout_philox import philox_keep_threshold
-
-    ref = _ck_reference_randval(*shape, seed, offset) <= philox_keep_threshold(p)
-    keep = _drop_mask(*shape, p, seed, offset).cpu().numpy().astype(bool)
-    assert (keep == ref).all(), f"{int((keep != ref).sum())} mismatching elements"
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("p", [0.2, 0.5])
+@pytest.mark.parametrize("D", [64, 128])
+def test_dropout_mask_bit_exact_flydsl(D, p, dtype):
+    # With kv_len == D, V = I gives out = P' and dO = I gives dV = P'^T; P > 0
+    # everywhere, so the nonzeros are exactly the kept elements.
+    if not _is_gfx950():
+        pytest.skip("flydsl dropout backward is gfx950-only")
+    B, H, S = 2, 3, D
+    torch.manual_seed(0)
+    q = torch.randn((B, S, H, D), device="cuda", dtype=dtype).requires_grad_(True)
+    k = torch.randn((B, S, H, D), device="cuda", dtype=dtype)
+    eye = torch.eye(D, device="cuda", dtype=dtype)[None, :, None, :].expand(B, S, H, D)
+    v = eye.contiguous().requires_grad_(True)
+    rng = torch.cuda.get_rng_state()
+    out = fmha.memory_efficient_attention(q, k, v, p=p)
+    out.backward(eye.contiguous())
+    torch.cuda.set_rng_state(rng)
+    ref = _drop_mask(_draw_seed(), B, H, S, S, p).bool()
+    fwd_keep = out.permute(0, 2, 1, 3) != 0  # [B, H, m, n]
+    bwd_keep = v.grad.permute(0, 2, 3, 1) != 0  # dV[b, n, h, m] -> [B, H, m, n]
+    assert torch.equal(fwd_keep, ref), f"forward: {int((fwd_keep != ref).sum())} bits"
+    assert torch.equal(bwd_keep, ref), f"backward: {int((bwd_keep != ref).sum())} bits"
 
 
 @rocm_only
@@ -113,7 +104,6 @@ def test_dropout_flydsl(seq_len, batch_size, h_len, k_len, p, seed, attn_bias, d
     op = fmha.flydsl.FwOp
     device = "cuda"
     scale = 3
-    # Dense self-attention only (q_len == kv_len). BMHK so we exercise >1 head.
     q_len = kv_len = seq_len
 
     query = (
@@ -142,13 +132,9 @@ def test_dropout_flydsl(seq_len, batch_size, h_len, k_len, p, seed, attn_bias, d
     )
     assert_allclose(out, out2, "dropout reproducibility")
 
-    # Correctness: the op reserves its Philox (seed, offset) from the default
-    # generator, so reseeding to `seed` and rebuilding the mask from the same
-    # generator state reproduces the op's exact mask; apply it to a head-by-head
-    # reference and compare. Dropout applies to the attention weights (not the
-    # output), so this masked reference is the only faithful check.
+    # Reseeding reproduces the op's Philox seed, hence its mask.
     torch.manual_seed(seed)
-    mask = _drop_mask(batch_size, h_len, q_len, kv_len, p, *_generator_state())
+    mask = _drop_mask(_draw_seed(), batch_size, h_len, q_len, kv_len, p)
     ref = torch.stack(
         [
             ref_attention_for_test(
@@ -158,10 +144,7 @@ def test_dropout_flydsl(seq_len, batch_size, h_len, k_len, p, seed, attn_bias, d
         ],
         dim=2,
     )
-    # A wrong mask diverges in thousands of elements; heavy dropout (p=0.7) +
-    # causal + bf16 leaves a handful of near-floor outputs at the bf16 floor
-    # (~0.04) that can exceed tolerance, so allow a tiny fraction of outliers while
-    # still catching any mask mismatch.
+    # A wrong mask diverges in thousands of elements; allow a few bf16 outliers.
     of = out.float()
     close = torch.isclose(of, ref.float(), atol=5e-2, rtol=2e-2)
     n_bad = int((~close).sum())
@@ -169,20 +152,18 @@ def test_dropout_flydsl(seq_len, batch_size, h_len, k_len, p, seed, attn_bias, d
         f"{n_bad}/{of.numel()} elements exceed tolerance (likely wrong dropout mask)"
     )
 
-    # Statistical: each trial uses a fresh, non-overlapping Philox counter range.
+    # Statistical: one fresh seed per trial.
     num_trials = 1000
     p_val_tol = 1e-6
     keep_prob = _keep_probability(p)
     masks = []
-    for trial in range(num_trials):
-        offset = trial * batch_size * h_len * 64
+    for _ in range(num_trials):
         masks.append(
-            _drop_mask(batch_size, h_len, q_len, kv_len, p, seed, offset).cpu()
+            _drop_mask(_draw_seed(), batch_size, h_len, q_len, kv_len, p).cpu()
         )
     masks = torch.stack(masks, dim=0)
     p_value = binomtest(int(masks.sum()), masks.numel(), p=keep_prob).pvalue
     assert p_value > p_val_tol, p_value
-    # Per-element check allows a few spurious outliers (~N*1e-6 expected at this tol).
     masks = masks.sum(0).flatten()
     p_values = _vec_binom_test(masks.numpy(), num_trials, p=keep_prob)
     n_outliers = int((p_values <= p_val_tol).sum())
@@ -193,177 +174,11 @@ def test_dropout_flydsl(seq_len, batch_size, h_len, k_len, p, seed, attn_bias, d
 
 @rocm_only
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("p", [0.0, 0.3, 0.7])
-@pytest.mark.parametrize("k_len", [64, 128])
-@pytest.mark.parametrize("h_len", [1, 3])
-@pytest.mark.parametrize("seq_len", [32, 256])
-def test_dropout_backward_flydsl(seq_len, h_len, k_len, p, dtype):
-    # The FlyDSL forward draws CK's Philox mask and stores CK's rng_state, so
-    # ck.BwOp must regenerate the identical mask. Compare the full fw+bw against
-    # CK end-to-end under the same seed.
-    if not fmha.ck.BwOp.is_available():
-        pytest.skip("ck.BwOp unavailable")
-    flyF = fmha.flydsl.FwOp
-    device = "cuda"
-    scale = 3
-    q_len = kv_len = seq_len
-
-    def mk():
-        torch.manual_seed(0)
-        q = torch.randn((1, q_len, h_len, k_len), device=device, dtype=dtype) * scale
-        k = torch.randn((1, kv_len, h_len, k_len), device=device, dtype=dtype) * scale
-        v = torch.randn((1, kv_len, h_len, k_len), device=device, dtype=dtype) * scale
-        return q, k, v
-
-    q, k, v = mk()
-    inp = fmha.Inputs(query=q, key=k, value=v, attn_bias=None, p=p)
-    if not flyF.supports(inp):
-        pytest.skip(f"{flyF.NAME}: unsupported input")
-
-    grad_out = torch.randn((1, q_len, h_len, k_len), device=device, dtype=dtype)
-
-    torch.manual_seed(77)
-    out_f, ctx_f = flyF.apply(inp, needs_gradient=True)
-    if p != 0.0:
-        assert ctx_f.rng_state is not None
-        assert ctx_f.rng_state.dtype == torch.int64
-        assert tuple(ctx_f.rng_state.shape) == (2,)
-        assert ctx_f.op_bw is fmha.flydsl.BwOp
-    g_f = fmha.ck.BwOp.apply(ctx_f, inp, grad_out)
-
-    torch.manual_seed(77)
-    out_c, ctx_c = fmha.ck.FwOp.apply(inp, needs_gradient=True)
-    g_c = fmha.ck.BwOp.apply(ctx_c, inp, grad_out)
-
-    if dtype is torch.float16:
-        # f16 (10-bit mantissa): flydslF+ck.BwOp matches ck end-to-end per element.
-        # atol 5e-2 covers the handful of near-zero elements at the f16 floor for
-        # kv>=256 (cancellation in the backward); rtol governs the signal.
-        assert_allclose(out_f.float(), out_c.float(), "fwd", atol=5e-2, rtol=2e-2)
-        assert_allclose(g_f.dq.float(), g_c.dq.float(), "dq", atol=5e-2, rtol=2e-2)
-        assert_allclose(g_f.dk.float(), g_c.dk.float(), "dk", atol=5e-2, rtol=2e-2)
-        assert_allclose(g_f.dv.float(), g_c.dv.float(), "dv", atol=5e-2, rtol=2e-2)
-    else:
-        # bf16 (8-bit mantissa): the attention backward is cancellation-dominated at
-        # near-zero gradients (and outputs), where bf16 has large per-element error
-        # regardless of kernel. Compare the aggregate relative L2 norm instead:
-        # robust to those outliers, but a wrong dropout mask still blows the norm up
-        # well past the thresholds.
-        def _rel_l2(a, b):
-            return (a - b).float().norm() / b.float().norm().clamp_min(1e-6)
-
-        for name, ga, gb, tol in (
-            ("fwd", out_f, out_c, 5e-2),
-            ("dq", g_f.dq, g_c.dq, 1e-1),
-            ("dk", g_f.dk, g_c.dk, 1e-1),
-            ("dv", g_f.dv, g_c.dv, 1e-1),
-        ):
-            rel = _rel_l2(ga, gb)
-            assert rel < tol, f"{name}: relative L2 {rel:.4f} exceeds {tol}"
-
-
-@rocm_only
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("p", [0.0, 0.3])
-@pytest.mark.parametrize("hq_len", [1, 3])
-@pytest.mark.parametrize("g_len", [2])
-@pytest.mark.parametrize("seq_len", [32, 128])
-def test_dropout_backward_bmghk_flydsl(seq_len, g_len, hq_len, p, dtype):
-    # BMGHK (5-D) dropout with gradients: the op folds G into H, runs the dense
-    # dropout forward, then re-wraps the 5-D context. That re-wrap must PRESERVE the
-    # philox rng_state (regression guard) so ck.BwOp can regenerate the 5-D mask
-    # instead of raising. Compare the full fw+bw against ck end to end.
-    if not fmha.ck.BwOp.is_available():
-        pytest.skip("ck.BwOp unavailable")
-    flyF = fmha.flydsl.FwOp
-    device = "cuda"
-    scale = 3
-    k_len = 128
-    q_len = kv_len = seq_len
-
-    def mk():
-        torch.manual_seed(0)
-        qs = (1, q_len, g_len, hq_len, k_len)
-        kvs = (1, kv_len, g_len, hq_len, k_len)
-        return (
-            torch.randn(qs, device=device, dtype=dtype) * scale,
-            torch.randn(kvs, device=device, dtype=dtype) * scale,
-            torch.randn(kvs, device=device, dtype=dtype) * scale,
-        )
-
-    q, k, v = mk()
-    inp = fmha.Inputs(query=q, key=k, value=v, attn_bias=None, p=p)
-    if not flyF.supports(inp):
-        pytest.skip(f"{flyF.NAME}: unsupported input")
-
-    grad_out = torch.randn((1, q_len, g_len, hq_len, k_len), device=device, dtype=dtype)
-
-    torch.manual_seed(77)
-    out_f, ctx_f = flyF.apply(inp, needs_gradient=True)
-    assert out_f.shape == q.shape
-    # LSE is unflattened back to the (G, Hq) head split.
-    assert tuple(ctx_f.lse.shape) == (1, g_len, hq_len, q_len), ctx_f.lse.shape
-    if p != 0.0:
-        # The 5-D re-wrap must keep rng_state, else ck.BwOp gets None and raises.
-        assert ctx_f.rng_state is not None
-        assert ctx_f.op_bw is fmha.flydsl.BwOp
-
-    # ck.BwOp runs on BMHK, so fold G into H exactly as the op's autograd wrapper
-    # does and drive the backward with the preserved rng_state. This confirms
-    # ck.BwOp can regenerate the 5-D dropout mask (the regression the fix guards)
-    # rather than getting rng_state=None and raising.
-    qf, kf, vf = q.flatten(2, 3), k.flatten(2, 3), v.flatten(2, 3)
-    inp_flat = fmha.Inputs(query=qf, key=kf, value=vf, attn_bias=None, p=p)
-    grad_flat = grad_out.flatten(2, 3)
-
-    def _bwd(out_x, lse_x, rng_x):
-        ctx = Context(
-            lse=lse_x.flatten(1, 2),
-            out=out_x.flatten(2, 3),
-            op_bw=fmha.ck.BwOp,
-            rng_state=rng_x,
-        )
-        return fmha.ck.BwOp.apply(ctx, inp_flat, grad_flat)
-
-    g_f = _bwd(out_f, ctx_f.lse, ctx_f.rng_state)
-
-    torch.manual_seed(77)
-    out_c, ctx_c = fmha.ck.FwOp.apply(inp, needs_gradient=True)
-    g_c = _bwd(out_c, ctx_c.lse, ctx_c.rng_state)
-
-    if dtype is torch.float16:
-        assert_allclose(out_f.float(), out_c.float(), "fwd", atol=5e-2, rtol=2e-2)
-        assert_allclose(g_f.dq.float(), g_c.dq.float(), "dq", atol=5e-2, rtol=2e-2)
-        assert_allclose(g_f.dk.float(), g_c.dk.float(), "dk", atol=5e-2, rtol=2e-2)
-        assert_allclose(g_f.dv.float(), g_c.dv.float(), "dv", atol=5e-2, rtol=2e-2)
-    else:
-
-        def _rel_l2(a, b):
-            return (a - b).float().norm() / b.float().norm().clamp_min(1e-6)
-
-        for name, ga, gb, tol in (
-            ("fwd", out_f, out_c, 5e-2),
-            ("dq", g_f.dq, g_c.dq, 1e-1),
-            ("dk", g_f.dk, g_c.dk, 1e-1),
-            ("dv", g_f.dv, g_c.dv, 1e-1),
-        ):
-            rel = _rel_l2(ga, gb)
-            assert rel < tol, f"{name}: relative L2 {rel:.4f} exceeds {tol}"
-
-
-def _is_gfx950():
-    return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
-
-
-@rocm_only
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
 @pytest.mark.parametrize("p", [0.3, 0.7])
 @pytest.mark.parametrize("k_len", [64, 128])
 @pytest.mark.parametrize("seq_len", [32, 200])
 def test_dropout_training_flydsl(seq_len, k_len, p, causal, dtype):
-    # Training-mode dropout through the public API: dispatch picks flydsl.FwOp,
-    # which pins flydsl.BwOp to regenerate the mask from rng_state.
     if not _is_gfx950():
         pytest.skip("flydsl dropout backward is gfx950-only")
     device, B, H = "cuda", 2, 3
@@ -374,11 +189,12 @@ def test_dropout_training_flydsl(seq_len, k_len, p, causal, dtype):
     )
     q, k, v = (t.requires_grad_(True) for t in (q, k, v))
     bias = fmha.attn_bias.LowerTriangularMask() if causal else None
-    seed, offset = _generator_state()
+    rng = torch.cuda.get_rng_state()
     out = fmha.memory_efficient_attention(q, k, v, bias, p)
     out.backward(grad)
 
-    mask = _drop_mask(B, H, seq_len, seq_len, p, seed, offset)
+    torch.cuda.set_rng_state(rng)
+    mask = _drop_mask(_draw_seed(), B, H, seq_len, seq_len, p)
     qr, kr, vr = (t.detach().float().requires_grad_(True) for t in (q, k, v))
     scores = torch.einsum("bqhd,bkhd->bhqk", qr, kr) * k_len**-0.5
     if causal:
@@ -388,9 +204,10 @@ def test_dropout_training_flydsl(seq_len, k_len, p, causal, dtype):
     ref = torch.einsum("bhqk,bkhd->bqhd", probs, vr)
     ref.backward(grad.float())
 
-    # A wrong or mismatched forward/backward mask gives O(1) relative errors.
     def _rel_l2(a, b):
-        return float((a.float() - b).norm() / b.norm().clamp_min(1e-6))
+        return float(
+            (a.detach().float() - b.detach()).norm() / b.norm().clamp_min(1e-6)
+        )
 
     tol = 2e-2 if dtype is torch.bfloat16 else 5e-3
     for name, got, want in (
