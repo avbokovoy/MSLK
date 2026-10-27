@@ -43,6 +43,10 @@ negative-path test in `test_backward.py`):
   `SUPPORTED_ATTN_BIAS_TYPES` not listing them (falls through to the base
   class's `type(d.attn_bias) not in cls.SUPPORTED_ATTN_BIAS_TYPES` check).
   Revisit if a backward caller for paged/gappy attention appears.
+
+`FwOp` non-goals:
+- Gradients through native paged KV: no backend has a paged backward and MSLK's
+  paged callers are forward-only. Declined in `FwOp.not_supported_reasons()`.
 """
 
 import math

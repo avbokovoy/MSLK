@@ -148,3 +148,21 @@ def test_forward_flydsl_paged(
     assert_allclose(
         out.float(), ref, atol=op.ERROR_ATOL[dtype], rtol=op.ERROR_RTOL[dtype]
     )
+
+
+@rocm_only
+def test_forward_flydsl_declines_paged_gradients():
+    q = torch.randn([1, 2, 4, 128], device="cuda", dtype=torch.bfloat16)
+    k = torch.randn([1, 128, 4, 128], device="cuda", dtype=torch.bfloat16)
+    block_tables = torch.arange(2, device="cuda", dtype=torch.int32).view(2, 1)
+    bias = fmha.attn_bias.BlockDiagonalPaddedKeysMask.from_seqlens(
+        [1, 1], 64, [64, 30]
+    ).make_paged(block_tables, 64, fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask)
+    reason = "native paged KV does not support gradients (no backward)"
+    assert reason not in flydsl.FwOp.not_supported_reasons(
+        fmha.Inputs(q, k, k, attn_bias=bias)
+    )
+    q.requires_grad_(True)
+    assert reason in flydsl.FwOp.not_supported_reasons(
+        fmha.Inputs(q, k, k, attn_bias=bias)
+    )
