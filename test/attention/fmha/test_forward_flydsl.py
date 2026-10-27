@@ -11,6 +11,8 @@ by @rocm_only (expunged, not skipped, on internal CI) and adds the op-specific
 decline / xfail policy.
 """
 
+from typing import Optional
+
 import pytest
 import torch
 from mslk.attention import fmha
@@ -81,7 +83,10 @@ def _paged_reference(q, k, v, mask, scale):
 @pytest.mark.parametrize("decode", [True, False], ids=["decode", "prefill"])
 @pytest.mark.parametrize("D", [64, 128, 256])
 @pytest.mark.parametrize("page_size", [16, 32, 64, 128])
-def test_forward_flydsl_paged(paged_type, decode: bool, D: int, page_size: int):
+@pytest.mark.parametrize("scale", [None, 0.3], ids=["default_scale", "custom_scale"])
+def test_forward_flydsl_paged(
+    paged_type, decode: bool, D: int, page_size: int, scale: Optional[float]
+):
     """Paged KV at page sizes below, at and above the kernel's 64-row tile."""
     op = flydsl.FwOp
     if not is_flydsl_available():
@@ -133,12 +138,13 @@ def test_forward_flydsl_paged(paged_type, decode: bool, D: int, page_size: int):
         k_pages.view(1, -1, H, D),
         v_pages.view(1, -1, H, D),
         paged_bias,
+        scale=scale,
         op=op,
     )
     mask = bias.materialize(
         (1, H, q.shape[1], k.shape[1]), device="cuda", dtype=torch.float32
     )
-    ref = _paged_reference(q, k, v, mask, D**-0.5)
+    ref = _paged_reference(q, k, v, mask, D**-0.5 if scale is None else scale)
     assert_allclose(
         out.float(), ref, atol=op.ERROR_ATOL[dtype], rtol=op.ERROR_RTOL[dtype]
     )
