@@ -1140,6 +1140,8 @@ def _flydsl_flash_attn_paged(
         or _paged_window
         or _small_pages
         or D not in (64, 128)
+        # Dualwave hardcodes 1/sqrt(head_dim); light folds sm_scale.
+        or sm_scale is not None
         or (
             _splitk_dtype_ok
             and (
@@ -1666,15 +1668,12 @@ def flydsl_flash_attn_func(
                 "flydsl_flash_attn_func: sliding-window (window_left>=0) is not "
                 "supported for gappy paged KV (kv_seqstart)"
             )
-    if sm_scale is not None:
-        # fp8 and native paged hardcode 1/sqrt(head_dim); gappy paged uses the
-        # generic kernel and folds sm_scale.
-        _gappy_paged = paged_kv and kv_seqstart is not None
-        if dtype_str == "fp8" or (paged_kv and not _gappy_paged):
-            raise NotImplementedError(
-                "flydsl_flash_attn_func: custom sm_scale is only supported on the "
-                "dense/varlen f16/bf16 paths (fp8/paged hardcode 1/sqrt(head_dim))"
-            )
+    if sm_scale is not None and dtype_str == "fp8":
+        # fp8 hardcodes 1/sqrt(head_dim).
+        raise NotImplementedError(
+            "flydsl_flash_attn_func: custom sm_scale is only supported for "
+            "f16/bf16 (fp8 hardcodes 1/sqrt(head_dim))"
+        )
     if bias is not None:
         _varlen_req = cu_seqlens_q is not None
         if dtype_str == "fp8" or paged_kv or _varlen_req:

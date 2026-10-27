@@ -345,11 +345,6 @@ class FwOp(AttentionFwOpBase):
         if _needs_grad and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
             reasons.append("native paged KV does not support gradients (no backward)")
 
-        # Non-gappy paged KV hardcodes 1/sqrt(head_dim); a custom scale is silently
-        # ignored (only gappy paged folds sm_scale).
-        if d.scale is not None and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
-            reasons.append("custom scale is not supported for native paged KV")
-
         # Q/K/V must be last-dim contiguous and 16-byte aligned for the kernel's
         # 128-bit vector loads (raw buffer-resource loads do not tolerate otherwise).
         for _name, _t in (("query", d.query), ("key", d.key), ("value", d.value)):
