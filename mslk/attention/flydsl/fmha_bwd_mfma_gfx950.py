@@ -238,8 +238,6 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
 
     # GQA atomic dV/dK store when multiple query heads share a KV head.
     _dvdk_atomic = heads_per_kv > 1
-    # The dropout keep-mask is a dense [B, H, Mq, Mk] plane per (batch, head).
-    assert not (has_dropout and varlen), "dropout backward is dense-only"
     lds_b = gfx950_lds_bytes(D, BLOCK_M, BLOCK_N, True, alias=True)
     assert lds_b <= _GFX950_LDS_BYTES, (
         f"use_trload LDS overflow: {lds_b}B > {_GFX950_LDS_BYTES}B at "

@@ -29,16 +29,13 @@ non-unit D stride) remain unsupported.
 Non-goals (intentionally excluded rather than left as silent gaps -- each
 entry below is enforced generically, see the cited mechanism, and has its own
 negative-path test in `test_backward.py`):
-- Dropout off gfx950 or on varlen/padded/paged inputs: only the gfx950 fused
-  kernel regenerates the forward's in-kernel Philox keep bits
-  (`mslk.attention.flydsl.dropout_philox`) from the seed in `ctx.rng_state`;
-  rejected via `_dropout_bwd_reasons()`. `flydsl.FwOp` pins this op as the
-  backward of a training-mode dropout forward and declines the same inputs.
+- Dropout off gfx950: only the gfx950 kernel regenerates the forward's mask
+  (`_dropout_bwd_reasons()`). `FwOp` pins this op for training-mode dropout.
 - True 5D BMGHK (`d.query.ndim == 5`, multi-query-group layout distinct from
   GQA-via-4D-broadcast, which IS supported): no MSLK caller found; rejected
   generically by the same `not_supported_reasons()`'s
   `not cls.SUPPORTS_BMGHK and d.query.ndim == 5` check (`SUPPORTS_BMGHK = False`
-  below). Revisit under the same condition as dropout.
+  below). Revisit if a caller needs the 5-D layout.
 - Paged-KV / gappy-keys backward (`PagedBlockDiagonal*Mask`,
   `BlockDiagonal*GappyKeys*Mask`): these are inference-serving-only shapes in
   MSLK (`tree_attention.py`'s forward-only code path never reaches
@@ -201,24 +198,14 @@ def _is_flydsl_available() -> bool:
         return False
 
 
-def _is_gfx950(device: torch.device) -> bool:
-    return "gfx950" in torch.cuda.get_device_properties(device).gcnArchName
-
-
 def _dropout_bwd_reasons(d: Inputs) -> List[str]:
-    """Why flydsl.BwOp cannot regenerate and apply the forward's dropout mask."""
-    reasons = []
-    if d.query.device.type == "cuda" and not _is_gfx950(d.query.device):
-        reasons.append("dropout backward is implemented for gfx950 only")
-    if isinstance(
-        d.attn_bias,
-        _VARLEN_BIAS_TYPES
-        + _PADDED_GAPPY_BIAS_TYPES
-        + _PAGED_BIAS_TYPES
-        + _PAGED_GAPPY_TYPES,
+    device = d.query.device
+    if (
+        device.type == "cuda"
+        and "gfx950" not in torch.cuda.get_device_properties(device).gcnArchName
     ):
-        reasons.append("dropout backward supports dense inputs only")
-    return reasons
+        return ["dropout backward is implemented for gfx950 only"]
+    return []
 
 
 @register_operator
@@ -334,17 +321,6 @@ class FwOp(AttentionFwOpBase):
                     f"cross-attention Mq={q_len} != Mkv={kv_len} not supported "
                     "(dense self-attention only)"
                 )
-
-        # Dropout: dense self-attention only (the in-kernel mask is applied on the
-        # generic dense path; varlen/paged/gappy dropout is not wired).
-        if d.p != 0.0 and isinstance(
-            d.attn_bias,
-            _VARLEN_BIAS_TYPES
-            + _PADDED_GAPPY_BIAS_TYPES
-            + _PAGED_BIAS_TYPES
-            + _PAGED_GAPPY_TYPES,
-        ):
-            reasons.append("dropout only supported on the dense self-attention path")
 
         # Native paged KV has no backward: the dualwave route emits no LSE and there
         # is no paged backward op, so a gradient request (return_lse on that route)
@@ -488,11 +464,8 @@ class FwOp(AttentionFwOpBase):
 
         kw["return_lse"] = needs_gradient
 
-        # Dropout (dense only): the kernel draws the keep bits in-kernel from a
-        # per-call device seed (dropout_philox), and the backward regenerates them
-        # from the same seed, kept as rng_state. The 1/(1-p) inverted-dropout scale
-        # is applied to the output in _run (a constant factor, so it factors out of
-        # the per-(q,k) sum).
+        # Dropout: per-call device seed, kept as rng_state for the backward. _run
+        # applies the 1/(1-p) scale.
         rng_state = None
         if inp.p != 0.0:
             from mslk.attention.flydsl.dropout_philox import draw_dropout_seed
@@ -510,7 +483,6 @@ class FwOp(AttentionFwOpBase):
             out, lse = result if needs_gradient else (result, None)
             out = out[..., :D_native].reshape(inp.query.shape)
             if inp.p != 0.0:
-                # Inverted-dropout output scale (the uint8 mask carries no scale).
                 out = out * (1.0 / (1.0 - inp.p))
             return out, lse
 
@@ -945,12 +917,11 @@ def _flydsl_bwd(
         )
     _dummy_bias = torch.zeros(1, device=device, dtype=dtype)
     _bias_arg = attn_bias if has_bias else _dummy_bias
-    # Dropout: the kernel regenerates the forward's keep bits from its device seed
-    # (the forward's rng_state). Dense gfx950 only (BwOp declines the rest).
+    # Dropout: regenerate the forward's keep bits from its seed (rng_state).
     has_dropout = dropout_seed is not None
-    if has_dropout and (not _is_gfx950 or varlen):
+    if has_dropout and not _is_gfx950:
         raise NotImplementedError(
-            "mslk_flydsl::fmha_bwd implements dropout for dense inputs on gfx950 only"
+            "mslk_flydsl::fmha_bwd implements dropout on gfx950 only"
         )
     if has_dropout:
         from mslk.attention.flydsl.dropout_philox import dropout_drop_threshold
@@ -1492,7 +1463,7 @@ class BwOp(AttentionBwOpBase):
     # D_SUBS_PER_WAVE comment).
     SUPPORTED_MAX_K = 256
     SUPPORTED_MIN_K = 32
-    # Dense gfx950 inputs only; see _dropout_bwd_reasons.
+    # gfx950 only; see _dropout_bwd_reasons.
     SUPPORTS_DROPOUT = True
     SUPPORTS_CUSTOM_SCALE = True
     SUPPORTS_DIFFERENT_VALUE_EMBED = False
