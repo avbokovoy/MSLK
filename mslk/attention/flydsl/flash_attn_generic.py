@@ -86,12 +86,19 @@ def build_flash_attn_func_module_primary(
     q_pack_qlen=0,
     q_pack_group=0,
     kv_lens=False,
+    head_dim_qk=None,
+    head_dim_v=None,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
     ``num_heads`` is the Q/O head count. For GQA/MQA, pass a smaller
     ``num_kv_heads``; each group of ``num_heads // num_kv_heads`` Q heads shares
     one K/V head. Dense launches accept any positive ``seq_len``.
+
+    ``head_dim`` is the compute width. Q/K rows may be stored ``head_dim_qk``
+    wide and V/O rows ``head_dim_v`` wide (both even and <= head_dim): the
+    missing columns read as zero and are never written. The default scale is
+    1/sqrt(head_dim_qk).
     """
     gpu_arch = get_hip_arch()
 
@@ -140,6 +147,8 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            head_dim_qk=head_dim_qk,
+            head_dim_v=head_dim_v,
         )
         _launcher_m256 = build_flash_attn_func_module_primary(
             num_heads,
@@ -169,6 +178,8 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            head_dim_qk=head_dim_qk,
+            head_dim_v=head_dim_v,
         )
         _bs_threshold = (
             2048 * num_heads if gpu_arch.startswith("gfx942") else 4096 * num_heads
@@ -270,6 +281,8 @@ def build_flash_attn_func_module_primary(
         q_pack_qlen=q_pack_qlen,
         q_pack_group=q_pack_group,
         kv_lens=kv_lens,
+        head_dim_qk=head_dim_qk,
+        head_dim_v=head_dim_v,
     )
     _flash_attn_generic_cache_tag = (traits.cache_tag, COMBINE_PREFETCH)
 
@@ -296,7 +309,7 @@ def build_flash_attn_func_module_primary(
         return _guarded
 
     if sm_scale is None:
-        sm_scale = 1.0 / host_math.sqrt(head_dim)
+        sm_scale = 1.0 / host_math.sqrt(traits.HEAD_DIM_QK)
 
     allocator = SmemAllocator(
         None,
@@ -920,7 +933,7 @@ def build_flash_attn_func_module_primary(
         bias_t = bias if bias is not None else Out
         drop_t = dropout if dropout is not None else Out
         skv = seq_len if seq_len_kv is None else seq_len_kv
-        sqn = traits.STRIDE_TOKEN_Q if stride_q_n is None else stride_q_n
+        sqn = traits.STRIDE_TOKEN_O if stride_q_n is None else stride_q_n
         stream_arg = fx.Stream(stream)
 
         tensor_args = (Q, K, V, Out, lse_t, ws_t, cq, ck, kvs, bt, bias_t, drop_t)
@@ -1032,7 +1045,7 @@ def build_flash_attn_func_module_primary(
                 batch_size,
                 seq_len,
                 skv,
-                traits.STRIDE_TOKEN_Q,
+                traits.STRIDE_TOKEN_O,
                 bias_t,
                 0,
                 0,
@@ -1085,6 +1098,8 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            head_dim_qk=head_dim_qk,
+            head_dim_v=head_dim_v,
         )
         _launch_mask = build_flash_attn_func_module_primary(
             num_heads,
@@ -1114,6 +1129,8 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            head_dim_qk=head_dim_qk,
+            head_dim_v=head_dim_v,
         )
 
         def _pad_dispatch(*args, **kwargs):

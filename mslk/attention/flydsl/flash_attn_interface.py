@@ -211,6 +211,8 @@ def _build_dense(
     has_bias: bool = False,
     has_dropout: bool = False,
     num_kv_splits: int = 1,
+    head_dim_qk: Optional[int] = None,
+    head_dim_v: Optional[int] = None,
 ):
     """Build (and cache) one dense generic launcher variant."""
     from .flash_attn_generic import build_flash_attn_func_module
@@ -218,6 +220,8 @@ def _build_dense(
     return build_flash_attn_func_module(
         num_heads=num_heads,
         head_dim=head_dim,
+        head_dim_qk=head_dim_qk,
+        head_dim_v=head_dim_v,
         causal=causal,
         dtype_str=dtype_str,
         num_kv_heads=num_kv_heads,
@@ -357,6 +361,8 @@ def _build_varlen_light(
     sm_scale: Optional[float] = None,
     gappy_kv: bool = False,
     num_kv_splits: int = 1,
+    head_dim_qk: Optional[int] = None,
+    head_dim_v: Optional[int] = None,
 ):
     """Build a lightweight packed-varlen launcher for short attention."""
     from .flash_attn_generic import build_flash_attn_func_module
@@ -364,6 +370,8 @@ def _build_varlen_light(
     return build_flash_attn_func_module(
         num_heads=num_heads,
         head_dim=head_dim,
+        head_dim_qk=head_dim_qk,
+        head_dim_v=head_dim_v,
         causal=causal,
         dtype_str=dtype_str,
         sm_scale=sm_scale,
@@ -1546,7 +1554,8 @@ def flydsl_flash_attn_func(
            Varlen: ``[total_q, H, D]`` (packed, cu_seqlens_q required).
         k: Key tensor. Dense: ``[B, Skv, Hkv, D]``.
            Varlen: ``[total_kv, Hkv, D]``.
-        v: Value tensor, same shape as k.
+        v: Value tensor, same shape as k except possibly the head dim (non-paged
+           f16/bf16; both head dims even and <= 256).
            Paged KV cache (future ABI): physical K/V cache tensors. Supported
            ``kv_cache_layout`` values:
            - ``linear``: 4D paged K/V, ``[NumBlocks, PageSize, NumKVHeads, HeadDim]``.
@@ -1587,7 +1596,7 @@ def flydsl_flash_attn_func(
         stream: CUDA/HIP stream to launch on.
 
     Returns:
-        Output tensor with the same shape as q (dtype bf16 for fp8 inputs,
+        Output tensor shaped like q with v's head dim (dtype bf16 for fp8 inputs,
         otherwise the same dtype as q). When ``return_lse=True``, returns a
         ``(out, lse)`` tuple instead, where ``lse`` is float32 ``[B, H, Sq]``
         (varlen: ``[B, H, max_seqlen_q]``; padded rows undefined).
@@ -1793,10 +1802,28 @@ def flydsl_flash_attn_func(
         raise ValueError(
             f"flydsl_flash_attn_func: num_heads ({H}) must be divisible by num_kv_heads ({num_kv_heads})"
         )
-    if D < 64 or D % 32 != 0:
+    # Stored head dims: Q/K rows are Dqk wide, V/O rows Dv wide. The kernels
+    # build D = 64/128/256; for anything else (or Dv != Dqk) the generic kernel
+    # computes at the next of those and masks the missing columns in-kernel.
+    Dqk = D
+    Dv = int(v.shape[-1])
+    if int(k.shape[-1]) != Dqk:
         raise ValueError(
-            f"flydsl_flash_attn_func: head_dim ({D}) must be >= 64 and a multiple of 32"
+            f"flydsl_flash_attn_func: k head_dim ({k.shape[-1]}) must match q ({Dqk})"
         )
+    masked_hd = Dv != Dqk or D not in (64, 128, 256)
+    if masked_hd:
+        D = next((d for d in (64, 128, 256) if d >= max(Dqk, Dv)), 0)
+        if not D or Dqk % 2 or Dv % 2:
+            raise ValueError(
+                f"flydsl_flash_attn_func: head dims (qk={Dqk}, v={Dv}) must be "
+                "even and <= 256"
+            )
+        if dtype_str == "fp8" or num_kv_splits > 1 or debug_counts is not None:
+            raise NotImplementedError(
+                f"flydsl_flash_attn_func: head dims (qk={Dqk}, v={Dv}) need the "
+                "generic f16/bf16 kernel (no fp8, explicit split-K or debug_counts)"
+            )
 
     splitk = num_kv_splits > 1
     # generic_splitk is chosen internally per-shape (below); it uses the generic
@@ -1859,6 +1886,8 @@ def flydsl_flash_attn_func(
                     or Sq <= _VARLEN_LIGHT_MAX_SEQ
                     # Gappy KV is only implemented on the generic (light) path.
                     or kv_seqstart is not None
+                    # Only the light kernel masks stored head dims.
+                    or masked_hd
                 )
             )
             if _prefer_light:
@@ -1880,6 +1909,8 @@ def flydsl_flash_attn_func(
                     window_left=window_left,
                     sm_scale=sm_scale,
                     gappy_kv=kv_seqstart is not None,
+                    head_dim_qk=Dqk,
+                    head_dim_v=Dv,
                 )
             else:
                 exe = _build_varlen(
@@ -1933,7 +1964,8 @@ def flydsl_flash_attn_func(
                 _has_bias = bias is not None
                 _has_dropout = dropout_mask is not None
                 if (
-                    not _windowed
+                    not masked_hd
+                    and not _windowed
                     and not _custom_scale
                     and not _has_bias
                     and not _has_dropout
@@ -1997,6 +2029,8 @@ def flydsl_flash_attn_func(
                             has_bias=_has_bias,
                             has_dropout=_has_dropout,
                             num_kv_splits=_gen_splits,
+                            head_dim_qk=Dqk,
+                            head_dim_v=Dv,
                         )
                     else:
                         block_m, flat_work_group_size, path_tag = _dense_generic_tile(
@@ -2019,12 +2053,18 @@ def flydsl_flash_attn_func(
                             sm_scale=sm_scale,
                             has_bias=_has_bias,
                             has_dropout=_has_dropout,
+                            head_dim_qk=Dqk,
+                            head_dim_v=Dv,
                         )
 
         # ── allocate output ─────────────────────────────────────────────────
         if out is None:
             out_dtype = torch.bfloat16 if dtype_str == "fp8" else q.dtype
-            out = torch.empty(q.shape, dtype=out_dtype, device=q.device)
+            out = torch.empty((*q.shape[:-1], Dv), dtype=out_dtype, device=q.device)
+        elif out.shape[-1] != Dv:
+            raise ValueError(
+                f"flydsl_flash_attn_func: output head_dim must be {Dv}, got {out.shape[-1]}"
+            )
         elif dtype_str == "fp8" and out.dtype != torch.bfloat16:
             raise ValueError(
                 f"flydsl_flash_attn_func: fp8 output must be bf16, got {out.dtype}"
@@ -2125,7 +2165,7 @@ def flydsl_flash_attn_func(
                     dropout_stride_q=int(drop_e.stride(2)),
                 )
             if generic_splitk:
-                # Dense combine writes O in [B, Sq, H, D] layout (stride_q_n = H*D).
+                # Dense combine writes O in [B, Sq, H, Dv] layout (stride_q_n = H*Dv).
                 _ws = torch.empty(
                     dualwave_splitk_workspace_elems(
                         B, H, Sq, int(num_kv_splits), head_dim=D
@@ -2134,7 +2174,7 @@ def flydsl_flash_attn_func(
                     device=q.device,
                 )
                 kwargs["workspace"] = _ws
-                kwargs["stride_q_n"] = H * D
+                kwargs["stride_q_n"] = H * Dv
             exe(q_flat, k_flat, v_flat, o_flat, B, Sq, **kwargs)
 
     return (out, lse) if return_lse else out
