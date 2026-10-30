@@ -12,6 +12,8 @@ decline / xfail policy.
 """
 
 import pytest
+import torch
+from mslk.attention import fmha
 from mslk.attention.fmha import flydsl
 
 from .case_generation import _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
@@ -57,3 +59,14 @@ def test_forward_flydsl(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt):
                 "multi-KV-tile softmax (kernel numerics sound; see docstring)"
             )
         raise
+
+
+@rocm_only
+def test_forward_flydsl_declines_dropout_gradients():
+    # flydsl.BwOp rejects head_dim 48, so training-mode dropout must decline.
+    q = torch.randn([2, 64, 4, 48], device="cuda", dtype=torch.bfloat16)
+    reason = "dropout backward (flydsl.BwOp): head_dim must be a multiple of 32"
+    assert reason not in flydsl.FwOp.not_supported_reasons(fmha.Inputs(q, q, q, p=0.3))
+    q.requires_grad_(True)
+    assert reason in flydsl.FwOp.not_supported_reasons(fmha.Inputs(q, q, q, p=0.3))
+    assert reason not in flydsl.FwOp.not_supported_reasons(fmha.Inputs(q, q, q))

@@ -29,16 +29,13 @@ non-unit D stride) remain unsupported.
 Non-goals (intentionally excluded rather than left as silent gaps -- each
 entry below is enforced generically, see the cited mechanism, and has its own
 negative-path test in `test_backward.py`):
-- Dropout (`d.p != 0.0`): no MSLK caller passes dropout through this op;
-  rejected generically by `AttentionOpBase.not_supported_reasons()`'s
-  `(d.p != 0.0) and not cls.SUPPORTS_DROPOUT` check (`SUPPORTS_DROPOUT = False`
-  below). Revisit if `flydsl.BwOp` is ever added to a live dispatch path and a
-  caller trips this.
+- Dropout off gfx950: only the gfx950 kernel regenerates the forward's mask
+  (`_dropout_bwd_reasons()`). `FwOp` pins this op for training-mode dropout.
 - True 5D BMGHK (`d.query.ndim == 5`, multi-query-group layout distinct from
   GQA-via-4D-broadcast, which IS supported): no MSLK caller found; rejected
   generically by the same `not_supported_reasons()`'s
   `not cls.SUPPORTS_BMGHK and d.query.ndim == 5` check (`SUPPORTS_BMGHK = False`
-  below). Revisit under the same condition as dropout.
+  below). Revisit if a caller needs the 5-D layout.
 - Paged-KV / gappy-keys backward (`PagedBlockDiagonal*Mask`,
   `BlockDiagonal*GappyKeys*Mask`): these are inference-serving-only shapes in
   MSLK (`tree_attention.py`'s forward-only code path never reaches
@@ -201,6 +198,16 @@ def _is_flydsl_available() -> bool:
         return False
 
 
+def _dropout_bwd_reasons(d: Inputs) -> List[str]:
+    device = d.query.device
+    if (
+        device.type == "cuda"
+        and "gfx950" not in torch.cuda.get_device_properties(device).gcnArchName
+    ):
+        return ["dropout backward is implemented for gfx950 only"]
+    return []
+
+
 @register_operator
 class FwOp(AttentionFwOpBase):
     """FlyDSL flash-attention forward (gfx942 generic / gfx950 dualwave)."""
@@ -315,17 +322,6 @@ class FwOp(AttentionFwOpBase):
                     "(dense self-attention only)"
                 )
 
-        # Dropout: dense self-attention only (the in-kernel mask is applied on the
-        # generic dense path; varlen/paged/gappy dropout is not wired).
-        if d.p != 0.0 and isinstance(
-            d.attn_bias,
-            _VARLEN_BIAS_TYPES
-            + _PADDED_GAPPY_BIAS_TYPES
-            + _PAGED_BIAS_TYPES
-            + _PAGED_GAPPY_TYPES,
-        ):
-            reasons.append("dropout only supported on the dense self-attention path")
-
         # Native paged KV has no backward: the dualwave route emits no LSE and there
         # is no paged backward op, so a gradient request (return_lse on that route)
         # would fail at run time. Decline so grad cases dispatch elsewhere.
@@ -334,6 +330,12 @@ class FwOp(AttentionFwOpBase):
         )
         if _needs_grad and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
             reasons.append("native paged KV does not support gradients (no backward)")
+        # Training-mode dropout pins flydsl.BwOp; decline what it cannot serve.
+        if _needs_grad and d.p != 0.0:
+            reasons.extend(
+                f"dropout backward (flydsl.BwOp): {r}"
+                for r in BwOp.not_supported_reasons(d)
+            )
 
         # Non-gappy paged KV hardcodes 1/sqrt(head_dim); a custom scale is silently
         # ignored (only gappy paged folds sm_scale).
@@ -462,24 +464,15 @@ class FwOp(AttentionFwOpBase):
 
         kw["return_lse"] = needs_gradient
 
-        # Dropout (dense only): Python-only mask via native torch RNG. This is
-        # CUDA-graph-safe and advances per replay, and drops the CK philox
-        # dependency. NOTE: backward mask regeneration is not implemented yet --
-        # training (needs_gradient) with dropout is rejected below until a
-        # flydsl dropout backward that reproduces this mask lands.
+        # Dropout: per-call device seed, kept as rng_state for the backward. _run
+        # applies the 1/(1-p) scale.
+        rng_state = None
         if inp.p != 0.0:
-            B = inp.query.shape[0]
-            Sq = inp.query.shape[1]
-            H = inp.query.shape[2]
-            Skv = inp.key.shape[1]
-            keep = (
-                torch.rand(B, H, Sq, Skv, device=inp.query.device, dtype=torch.float32)
-                >= inp.p
-            )
-            # uint8 keep-mask (0/1), half the memory of a bf16/f16 mask. The
-            # 1/(1-p) inverted-dropout scale is applied to the output in _run
-            # (a constant factor, so it factors out of the per-(q,k) sum).
-            kw["dropout_mask"] = keep.to(torch.uint8)
+            from mslk.attention.flydsl.dropout_philox import draw_dropout_seed
+
+            rng_state = draw_dropout_seed(inp.query.device)
+            kw["dropout_p"] = inp.p
+            kw["dropout_seed"] = rng_state
 
         # Shared tail: pad the head dim, call, unpack LSE, slice padded columns off O,
         # restore input shape (slice/reshape are no-ops when a path didn't pad).
@@ -490,7 +483,6 @@ class FwOp(AttentionFwOpBase):
             out, lse = result if needs_gradient else (result, None)
             out = out[..., :D_native].reshape(inp.query.shape)
             if inp.p != 0.0:
-                # Inverted-dropout output scale (the uint8 mask carries no scale).
                 out = out * (1.0 / (1.0 - inp.p))
             return out, lse
 
@@ -647,23 +639,15 @@ class FwOp(AttentionFwOpBase):
         if needs_gradient:
             if lse is None:
                 raise RuntimeError("FlyDSL forward did not return LSE for backward")
-            if inp.p != 0.0:
-                # TODO: implement a flydsl dropout backward that regenerates the
-                # Python (torch RNG) mask. Until then the mask cannot be
-                # reproduced in the backward (ck.BwOp only knows CK philox), so
-                # reject training + dropout rather than return wrong gradients.
-                raise NotImplementedError(
-                    "flydsl dropout backward is not implemented yet for the "
-                    "Python-generated mask; dropout is currently forward/"
-                    "inference-only (needs_gradient=False)."
-                )
             # op_bw=None lets _dispatch_bw pick a compatible backward
             # (VARLEN_LSE_PACKED=True). It currently resolves to ck.BwOp, which
             # matches this forward for bf16 and f16. The native BwOp below is NOT
             # yet wired as the default: the flydsl FwOp+BwOp pair diverges for
             # f16 (never tested together upstream) and needs numerical
-            # verification before it can be preferred here.
-            ctx = Context(lse=lse, out=out, op_bw=None)
+            # verification before it can be preferred here. Dropout is the
+            # exception: only flydsl.BwOp regenerates this forward's mask.
+            ctx = Context(lse=lse, out=out, op_bw=BwOp if inp.p != 0.0 else None)
+            ctx.rng_state = rng_state
         return out, ctx
 
 
@@ -796,6 +780,8 @@ def _flydsl_bwd(
     attn_bias: Optional[torch.Tensor] = None,
     needs_dbias: bool = False,
     window_left: int = -1,
+    dropout_seed: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # pyre-ignore[21]: FlyDSL is available only in AMD builds.
     import flydsl.compiler as flyc
@@ -931,6 +917,22 @@ def _flydsl_bwd(
         )
     _dummy_bias = torch.zeros(1, device=device, dtype=dtype)
     _bias_arg = attn_bias if has_bias else _dummy_bias
+    # Dropout: regenerate the forward's keep bits from its seed (rng_state).
+    has_dropout = dropout_seed is not None
+    if has_dropout and not _is_gfx950:
+        raise NotImplementedError(
+            "mslk_flydsl::fmha_bwd implements dropout on gfx950 only"
+        )
+    if has_dropout:
+        from mslk.attention.flydsl.dropout_philox import dropout_drop_threshold
+
+        _dropout_arg = dropout_seed
+        dropout_threshold = dropout_drop_threshold(dropout_p)
+        dropout_rp = 1.0 / (1.0 - dropout_p)
+    else:
+        _dropout_arg = torch.zeros(1, device=device, dtype=torch.int64)
+        dropout_threshold = 0
+        dropout_rp = 1.0
     if attn_bias is not None:
         bias_stride_b = attn_bias.stride(0)
         bias_stride_h = attn_bias.stride(1)
@@ -995,6 +997,9 @@ def _flydsl_bwd(
             bias_stride_q,
             dBias_out,
             dbias_sink,
+            _dropout_arg,
+            dropout_threshold,
+            dropout_rp,
             stream,
         )
         gfx950_key = (
@@ -1010,6 +1015,7 @@ def _flydsl_bwd(
             has_bias,
             emit_dbias,
             window_left,
+            has_dropout,
         )
         compiled_gfx950 = _gfx950_kernel_cache.get(gfx950_key)
         if compiled_gfx950 is None:
@@ -1028,6 +1034,7 @@ def _flydsl_bwd(
                 ck_scope_dvdk=True,
                 has_bias=has_bias,
                 emit_dbias=emit_dbias,
+                has_dropout=has_dropout,
             )
             # flyc.compile executes the kernel once (JIT warm run) -- dQ (and
             # dV/dK, always atomic-add under ck_scope_dvdk's per-query-head
@@ -1064,6 +1071,9 @@ def _flydsl_bwd(
                 bias_stride_q,
                 torch.zeros_like(dBias_out),
                 dbias_sink,
+                _dropout_arg,
+                dropout_threshold,
+                dropout_rp,
                 stream,
             )
             compiled_gfx950 = flyc.compile(launch_gfx950, *args_compile)
@@ -1413,6 +1423,8 @@ def _flydsl_bwd_abstract(
     attn_bias: Optional[torch.Tensor] = None,
     needs_dbias: bool = False,
     window_left: int = -1,
+    dropout_seed: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # db is empty (not None) when no bias gradient was requested: the schema's
     # return arity is fixed, so `apply` keys off numel() rather than None.
@@ -1451,7 +1463,8 @@ class BwOp(AttentionBwOpBase):
     # D_SUBS_PER_WAVE comment).
     SUPPORTED_MAX_K = 256
     SUPPORTED_MIN_K = 32
-    SUPPORTS_DROPOUT = False
+    # gfx950 only; see _dropout_bwd_reasons.
+    SUPPORTS_DROPOUT = True
     SUPPORTS_CUSTOM_SCALE = True
     SUPPORTS_DIFFERENT_VALUE_EMBED = False
     # GQA is supported via the plain 4D BMHK path (key/value with Hkv < Hq,
@@ -1541,6 +1554,8 @@ class BwOp(AttentionBwOpBase):
                     "LowerTriangularMaskWithTensorBias does not support a bias "
                     "gradient through the fMHA autograd wrapper"
                 )
+        if d.p != 0.0:
+            reasons.extend(_dropout_bwd_reasons(d))
         return reasons
 
     @classmethod
@@ -1579,6 +1594,10 @@ class BwOp(AttentionBwOpBase):
             if isinstance(inp.attn_bias, _WINDOW_BIAS_TYPES)
             else -1
         )
+        if inp.p != 0.0 and ctx.rng_state is None:
+            raise NotImplementedError(
+                "flydsl.BwOp dropout needs the forward's rng_state"
+            )
         dq, dk, dv, db = cls.OPERATOR(
             inp.query,
             inp.key,
@@ -1593,6 +1612,8 @@ class BwOp(AttentionBwOpBase):
             bias_t,
             needs_dbias,
             window_left,
+            ctx.rng_state if inp.p != 0.0 else None,
+            inp.p,
         )
         # GQA-via-broadcast (`key`/`value` genuinely Hkv-headed, exposed to
         # the caller as an H-headed stride-0 `.expand()` view -- see

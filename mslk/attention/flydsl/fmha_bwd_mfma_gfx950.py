@@ -17,6 +17,12 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw, ArithValue
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from mslk.attention.flydsl.dropout_philox import (
+    dropout_random_words,
+    keep_flag,
+    load_dropout_key,
+    select_word,
+)
 from mslk.attention.flydsl.fmha_bwd_mfma import (
     _ds_read_tr_v4,
     _grad_ds_unscaled,
@@ -30,6 +36,10 @@ from mslk.attention.flydsl.fmha_bwd_mfma import (
 )
 
 _GFX950_LDS_BYTES = 160 * 1024
+
+
+def _mulf(a, b, fm):
+    return fx.Float32(arith.mulf(_raw(a), _raw(b), fastmath=fm))
 
 
 def gfx950_lds_bytes(
@@ -105,6 +115,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     has_bias: bool = False,
     emit_dbias: bool = False,
     window_left: int = -1,
+    has_dropout: bool = False,
 ):
     """FUSED dQ + dV + dK in one N-tile-gridded kernel (gfx950/CDNA4 only),
     using the trload pipeline: Q/K/V/dO are loaded once and S/dP/P/dS are
@@ -390,6 +401,9 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         bias_stride_q: fx.Int32,
         dBias: fx.Tensor,
         dbias_sink: fx.Int32,
+        Dropout: fx.Tensor,
+        dropout_threshold: fx.Int32,
+        dropout_rp: fx.Float32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -584,6 +598,11 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             bias_plane_base = batch_idx * fx.Index(bias_stride_b) + head_idx * fx.Index(
                 bias_stride_h
             )
+        # Dropout: regenerate the forward's keep bits. P * keep * rp feeds dV and
+        # dP * keep * rp feeds dS; D = rowsum(dO * O) already includes dropout.
+        if const_expr(has_dropout):
+            drop_key = load_dropout_key(Dropout)
+            drop_bh = batch_idx * n_heads_idx + head_idx
         # dL/dBias is dL/dS_total, i.e. the UNSCALED dS below -- scale belongs only to
         # the dQ/dK GEMMs. One writer per element, so no atomics and no reduction.
         if const_expr(emit_dbias):
@@ -1486,7 +1505,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                         # re-reads no LDS -- the emitted work is the same, only its
                         # order differs.
                         _epi_passes = 2
-                        _epi_p_vals, _epi_valids = {}, {}
+                        _epi_p_vals, _epi_valids, _epi_keep_rp = {}, {}, {}
                         for _epi_pass in range_constexpr(_epi_passes):
                             _epi_do_p = _epi_pass == 0
                             _epi_do_ds = _epi_pass == 1
@@ -1619,12 +1638,33 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                             )
                                             _epi_p_vals[(n_grp, m_half, r)] = p_val
                                             _epi_valids[(n_grp, m_half, r)] = valid_mn
+                                            if const_expr(has_dropout):
+                                                n_idx = fx.Index(n_row_abs)
+                                                words = dropout_random_words(
+                                                    drop_key,
+                                                    drop_bh,
+                                                    fx.Index(m_row_abs),
+                                                    n_idx,
+                                                )
+                                                keep = keep_flag(
+                                                    select_word(words, n_idx),
+                                                    dropout_threshold,
+                                                )
+                                                _epi_keep_rp[(n_grp, m_half, r)] = (
+                                                    _mulf(keep, dropout_rp, fm)
+                                                )
                                         else:
                                             p_val = _epi_p_vals[(n_grp, m_half, r)]
                                             valid_mn = _epi_valids[(n_grp, m_half, r)]
                                         if const_expr(_epi_do_ds):
                                             dm_val = Vec(dm_grp)[r]
                                             dp_val = Vec(dp_accs[ai])[r]
+                                            if const_expr(has_dropout):
+                                                dp_val = _mulf(
+                                                    dp_val,
+                                                    _epi_keep_rp[(n_grp, m_half, r)],
+                                                    fm,
+                                                )
                                             ds_val = _grad_ds_unscaled(
                                                 p_val, dp_val, dm_val, valid_mn, fm
                                             )
@@ -1636,9 +1676,16 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                         # only the lds_p write is dropped (P feeds only
                                         # dV/GEMM2).
                                         if const_expr(_epi_do_p):
+                                            p_dv = p_val
+                                            if const_expr(has_dropout):
+                                                p_dv = _mulf(
+                                                    p_val,
+                                                    _epi_keep_rp[(n_grp, m_half, r)],
+                                                    fm,
+                                                )
                                             fx.memref_store(
                                                 Vec.from_elements(
-                                                    [p_val], fx.Float32
+                                                    [p_dv], fx.Float32
                                                 ).to(elem_dtype)[0],
                                                 p_regs_ns[ai],
                                                 r,
@@ -2106,6 +2153,9 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         bias_stride_q: fx.Int32,
         dBias: fx.Tensor,
         dbias_sink: fx.Int32,
+        Dropout: fx.Tensor,
+        dropout_threshold: fx.Int32,
+        dropout_rp: fx.Float32,
         stream: fx.Stream,
     ):
         from flydsl._mlir import ir
@@ -2150,6 +2200,9 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             bias_stride_q,
             dBias,
             dbias_sink,
+            Dropout,
+            dropout_threshold,
+            dropout_rp,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_SIZE, 1, 1),
