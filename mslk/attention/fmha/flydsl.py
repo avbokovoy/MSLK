@@ -54,6 +54,10 @@ negative-path test in `test_backward.py`):
   `BlockDiagonalCausalLocalAttentionMask`, is implemented. Rejected the same
   way, via `SUPPORTED_ATTN_BIAS_TYPES` omission. Revisit if a caller needs
   bottom-right causal masking specifically.
+
+`FwOp` non-goals:
+- Gradients through native paged KV: no backend has a paged backward and MSLK's
+  paged callers are forward-only. Declined in `FwOp.not_supported_reasons()`.
 """
 
 import math
@@ -167,16 +171,28 @@ _VARLEN_BIAS_TYPES = (
     BlockDiagonalCausalLocalAttentionFromBottomRightMask,
 )
 
-# Paged-KV mask types, driven through the kernel's vLLM paged path (native D 64/128;
-# any page_size that is a multiple of 64, remapped to 64-row sub-pages).
+# Paged-KV mask types, driven through the kernel's vLLM paged path (native D
+# 64/128/256; page_size as in _kernel_page_size).
 _PAGED_BIAS_TYPES = (
     PagedBlockDiagonalPaddedKeysMask,
     PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
 )
-_PAGED_HEAD_DIMS = (64, 128)
-# The generic paged kernel tiles KV at PAGE_SIZE == BLOCK_N == 64; paged-gappy
-# reshapes any physical page_size to 64-row sub-pages (see _apply_bmhk).
+_PAGED_HEAD_DIMS = (64, 128, 256)
+# The generic paged kernel tiles KV at BLOCK_N == 64.
 _KERNEL_PAGE_SIZE = 64
+
+
+def _kernel_page_size(page_size: int) -> Optional[int]:
+    """Page size the paged kernels are given, or None if unsupported.
+
+    Multiples of 64 are split into 64-row sub-pages; divisors of 64 pass as-is.
+    """
+    if page_size % _KERNEL_PAGE_SIZE == 0:
+        return _KERNEL_PAGE_SIZE
+    if page_size > 0 and _KERNEL_PAGE_SIZE % page_size == 0:
+        return page_size
+    return None
+
 
 # Paged-gappy: handled by a host gather through block_tables into a tight packing on
 # the varlen path (page-size-agnostic, no kernel paged path). Non-causal.
@@ -273,25 +289,23 @@ class FwOp(AttentionFwOpBase):
         if Kv != K:
             reasons.append("value head_dim must equal query head_dim")
 
-        # Paged KV kernel fixes PAGE_SIZE 64 and D in {64, 128}; a larger physical
-        # page_size (multiple of 64) is remapped to 64-row sub-pages in _apply_bmhk.
+        # Paged KV runs at native D only (no head-dim padding of the cache).
         if isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
-            if d.attn_bias.page_size % _KERNEL_PAGE_SIZE != 0:
+            if _kernel_page_size(d.attn_bias.page_size) is None:
                 reasons.append(
                     f"paged page_size={d.attn_bias.page_size} must be a "
-                    f"multiple of {_KERNEL_PAGE_SIZE}"
+                    f"multiple or a divisor of {_KERNEL_PAGE_SIZE}"
                 )
             if K not in _PAGED_HEAD_DIMS:
                 reasons.append(
                     f"paged head_dim={K} unsupported (kernel paged: {_PAGED_HEAD_DIMS})"
                 )
-        # Paged-gappy uses the generic paged kernel (per-row page lookup). D is
-        # padded to {64,128,256}; page_size must be a multiple of the kernel's 64.
+        # Paged-gappy uses the generic paged kernel; D is padded to {64,128,256}.
         if isinstance(d.attn_bias, _PAGED_GAPPY_TYPES):
-            if d.attn_bias.page_size % _KERNEL_PAGE_SIZE != 0:
+            if _kernel_page_size(d.attn_bias.page_size) is None:
                 reasons.append(
                     f"paged-gappy page_size={d.attn_bias.page_size} must be a "
-                    f"multiple of {_KERNEL_PAGE_SIZE}"
+                    f"multiple or a divisor of {_KERNEL_PAGE_SIZE}"
                 )
         # Dense bottom-right causal cross-attention requires Mq <= Mkv; for Mq > Mkv
         # the leading rows are fully masked (undefined softmax).
@@ -334,11 +348,6 @@ class FwOp(AttentionFwOpBase):
         )
         if _needs_grad and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
             reasons.append("native paged KV does not support gradients (no backward)")
-
-        # Non-gappy paged KV hardcodes 1/sqrt(head_dim); a custom scale is silently
-        # ignored (only gappy paged folds sm_scale).
-        if d.scale is not None and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
-            reasons.append("custom scale is not supported for native paged KV")
 
         # Q/K/V must be last-dim contiguous and 16-byte aligned for the kernel's
         # 128-bit vector loads (raw buffer-resource loads do not tolerate otherwise).
@@ -516,13 +525,13 @@ class FwOp(AttentionFwOpBase):
             Dk = inp.key.shape[-1]
             q = inp.query.reshape(-1, H, inp.query.shape[-1])
             page_size = int(bias.page_size)
-            # The paged kernel fixes PAGE_SIZE == 64. For a larger physical page_size
-            # (a multiple of 64), reshape the cache into 64-row sub-pages and expand
-            # block_table so each logical page p maps to sub-pages [p*sub, p*sub+sub);
-            # this preserves the physical layout while giving the kernel 64-row pages.
-            sub = page_size // _KERNEL_PAGE_SIZE
-            k = inp.key.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk)
-            v = inp.value.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk)
+            # Split pages larger than 64 rows into 64-row sub-pages; logical page p
+            # maps to sub-pages [p*sub, p*sub+sub).
+            kernel_page = _kernel_page_size(page_size)
+            assert kernel_page is not None
+            sub = page_size // kernel_page
+            k = inp.key.reshape(-1, kernel_page, Hkv, Dk)
+            v = inp.value.reshape(-1, kernel_page, Hkv, Dk)
             seqlen_k = bias.k_seqinfo.seqlen.to(q.device)
             # cu_seqlens_kv = cumulative per-seq KV lengths; pages via block_table.
             kseq = torch.nn.functional.pad(
@@ -573,14 +582,12 @@ class FwOp(AttentionFwOpBase):
             Dk = inp.key.shape[-1]
             q = _pad_hd(inp.query.reshape(-1, H, Dk))
             page_size = int(bias.page_size)
-            # The generic paged kernel fixes PAGE_SIZE == BLOCK_N == 64. Reshape the
-            # physical cache to 64-row sub-pages and expand block_table so each
-            # logical page p maps to sub-pages [p*sub, p*sub+sub); this keeps the
-            # in-kernel per-row page lookup valid at any physical page_size. Head dim
-            # is zero-padded (last axis) like the other paths.
-            sub = page_size // _KERNEL_PAGE_SIZE
-            k = _pad_hd(inp.key.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk))
-            v = _pad_hd(inp.value.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk))
+            # Sub-pages as in the paged path above; head dim is zero-padded.
+            kernel_page = _kernel_page_size(page_size)
+            assert kernel_page is not None
+            sub = page_size // kernel_page
+            k = _pad_hd(inp.key.reshape(-1, kernel_page, Hkv, Dk))
+            v = _pad_hd(inp.value.reshape(-1, kernel_page, Hkv, Dk))
             # sm_scale (native, pinned above when padding) is folded by the generic
             # paged kernel, so no Q pre-scale is needed.
             bt = bias.block_tables.to(torch.int32).to(q.device)
