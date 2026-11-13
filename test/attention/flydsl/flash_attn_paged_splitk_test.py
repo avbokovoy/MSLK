@@ -1351,7 +1351,10 @@ def test_chain_sized_splits_respect_workspace(monkeypatch):
 
 def test_window_sized_splits_respect_workspace_after_lds_floor(monkeypatch):
     """The block-table floor raises a windowed split count only while the
-    workspace stays in budget; past that the shape is left to be rejected."""
+    workspace stays in budget. Past that a split walks more pages than the
+    block-table LDS window: the light kernel, which reads page ids from the
+    block table directly, still runs it; only the dualwave route, which stages
+    the block table in LDS, rejects it."""
     monkeypatch.setattr(fai, "_PAGED_WS_BUDGET_MB", 1)
     batch, heads, seqlen_q, head_dim = 4, 8, 64, 128
     max_kv_pages = 2 * fai._PAGED_BT_LDS_SIZE

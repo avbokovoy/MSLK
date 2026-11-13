@@ -272,7 +272,8 @@ class FwOp(AttentionFwOpBase):
         if Kv != K and isinstance(d.attn_bias, _PAGED_BIAS_TYPES + _PAGED_GAPPY_TYPES):
             reasons.append("paged KV needs value head_dim == query head_dim")
 
-        # Paged KV runs at native D only (no head-dim padding of the cache).
+        # Paged KV reads the cache in place at its own head dim (no padding); 96
+        # runs masked at 128.
         if isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
             if _kernel_page_size(d.attn_bias.page_size) is None:
                 reasons.append(

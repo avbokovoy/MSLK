@@ -1255,11 +1255,13 @@ def _flydsl_flash_attn_paged(
     # paged kernel and pa_decode_swa.
     window_left: int = -1,
 ) -> torch.Tensor:
-    """Native paged-KV attention on the gfx950 dualwave kernel.
+    """Native paged-KV attention (generic light, gfx950 dualwave or decode kernels).
 
     Supported config ONLY (anything else raises): linear/vectorized cache layout
-    [NumBlocks, PageSize=64, NumKVHeads, HeadDim], vLLM lookup (block_table +
-    seqlen_k), causal, D=64/128, dtype bf16/f16.
+    [NumBlocks, PageSize, NumKVHeads, HeadDim] with PageSize=64, or 16/32 on the
+    linear layout (light kernel); vLLM lookup (block_table + seqlen_k), causal or not,
+    D=64/128/256 (other even D <= 256 masked at the next, linear only), dtype
+    bf16/f16. Split-K needs D=64/128.
     - Dense 4D Q ``[B, Sq, H, D]``: split-K supported at any Sq. On the light
       route ``num_kv_splits`` 0 and 1 size the count from KV-chain length
       (``_paged_auto_num_kv_splits``); ``>1`` forces.
@@ -1342,8 +1344,8 @@ def _flydsl_flash_attn_paged(
         )
     if vectorized and _masked_hd:
         raise NotImplementedError(
-            "flydsl_flash_attn_func: vectorized paged KV supports head_dim 64 or 128 "
-            f"only, got {D}"
+            "flydsl_flash_attn_func: vectorized paged KV supports head_dim 64, 128 "
+            f"or 256 only, got {D}"
         )
 
     _validate_paged_metadata("block_table", block_table, q.device, 2, B)
@@ -1552,8 +1554,9 @@ def _flydsl_flash_attn_paged(
     else:
         page_size = int(k.shape[1])
         k_head_dim = int(k.shape[3])
-    # Gappy paged uses the generic kernel (any D the generic path builds; the op
-    # reshapes the cache to 64-row sub-pages), so skip the native-paged D/page gates.
+    # Gappy paged uses the generic kernel (any D the generic path builds; the fmha
+    # op splits larger pages into 64-row sub-pages and passes divisors of 64
+    # as-is), so skip the native-paged D/page gates.
     _gappy = kv_seqstart is not None
     # Pages below the 64-row KV tile and D=256 use the light kernel (linear only).
     _small_pages = page_size < _PAGED_PAGE_SIZE
@@ -2120,6 +2123,8 @@ def flydsl_flash_attn_func(
              ``V = [NumBlocks, NumKVHeads, PageSize / kVectorSize, HeadDim, kVectorSize]``.
              Here ``kVectorSize = 16 / element_size`` (bf16/fp16: 8, fp8: 16);
              page_size and head_dim must be divisible by it.
+           Native paged KV takes PageSize 64, or 16/32 with the ``linear``
+           layout; head dims as below, including 256; and a custom ``sm_scale``.
         causal: Bottom-right aligned causal mask when True.
         num_kv_heads: KV head count for GQA/MQA; defaults to q num_heads (MHA).
         cu_seqlens_q: Int32 ``[B+1]`` cumulative Q token counts (varlen).
