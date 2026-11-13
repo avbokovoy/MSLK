@@ -25,7 +25,7 @@ from mslk.attention.flydsl.flash_attn_interface import (
 from mslk.flydsl.common import is_flydsl_available
 from paged_reference import paged_reference, run_on_busy_side_stream, spy
 
-PAGE = 64  # _PAGED_PAGE_SIZE: the only page size the native paged kernel takes
+PAGE = 64  # _PAGED_PAGE_SIZE: one page per KV tile, the page size these tests use
 H, HKV = 32, 4
 
 
