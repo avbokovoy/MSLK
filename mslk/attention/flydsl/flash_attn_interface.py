@@ -1791,9 +1791,18 @@ def _flydsl_flash_attn_paged(
                 D_run,
                 min(Sq, _paged_bm),
             )
-            # A masked build reads K/V through the cooperative loads only.
-            _k_prefetch = not _masked_hd and _paged_k_prefetch(
-                D_run, window_left, _gqa_qlen if _gqa_packed else Sq, skv, num_kv_splits
+            # A masked build reads K/V through the cooperative loads only, and
+            # pages below a KV tile have no K prefetch, K/V DMA or pid registers.
+            _k_prefetch = (
+                not _masked_hd
+                and not _small_pages
+                and _paged_k_prefetch(
+                    D_run,
+                    window_left,
+                    _gqa_qlen if _gqa_packed else Sq,
+                    skv,
+                    num_kv_splits,
+                )
             )
             if _paged_light_ok:
                 exe = _build_paged_light(
@@ -1821,6 +1830,7 @@ def _flydsl_flash_attn_paged(
                     kv_lens=_dense_kv_lens,
                     block_m=_paged_bm,
                     kv_dma=not _masked_hd
+                    and not _small_pages
                     and _paged_kv_dma(
                         _paged_bm, D_run, window_left, skv, num_kv_splits
                     ),
@@ -1828,7 +1838,9 @@ def _flydsl_flash_attn_paged(
                     window_left=window_left,
                     num_kv_splits=int(num_kv_splits),
                     fused_combine=fused_combine,
-                    pid_regs=_paged_pid_regs(max_pages_per_split) and not _k_prefetch,
+                    pid_regs=not _small_pages
+                    and _paged_pid_regs(max_pages_per_split)
+                    and not _k_prefetch,
                     head_dim_qk=D,
                     head_dim_v=D,
                     page_size=page_size,

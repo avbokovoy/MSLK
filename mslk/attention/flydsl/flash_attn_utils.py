@@ -1708,6 +1708,25 @@ def _make_flash_attn_generic_traits(
     block_n_out = 128 if path == "N128" else block_n
     n_subtiles = block_n_out // block_n
 
+    # Pages smaller than a KV tile are resolved per row (GenericPageIdLoader).
+    page_size = block_n if page_size is None else int(page_size)
+    small_pages = bool(paged) and page_size != block_n
+    if small_pages:
+        if not (0 < page_size < block_n and block_n % page_size == 0):
+            raise ValueError(
+                f"generic paged kernel supports page_size dividing {block_n}, "
+                f"got {page_size}"
+            )
+        if kv_cache_layout == "vectorized" or n_subtiles != 1:
+            raise ValueError(
+                f"generic paged kernel supports page_size < {block_n} only with "
+                "the linear kv_cache_layout on a single-subtile (N32) path"
+            )
+        # Paged DMA, K prefetch and pid registers read one page per tile.
+        paged_kv_dma = False
+        paged_k_prefetch = False
+        paged_pid_regs = False
+
     enable_prefetch_3buf = (
         os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_PREFETCH3", "0") == "1"
         and not masked_paged
@@ -1741,6 +1760,7 @@ def _make_flash_attn_generic_traits(
             and not gpu_arch.startswith("gfx942")
             and kv_cache_layout == "linear"
             and not gappy_kv
+            and not small_pages
         )
         enable_dma = paged_dma_ok and (enable_dma or paged_kv_dma)
     enable_gfx942_kv_gpfetch = (
@@ -1823,19 +1843,6 @@ def _make_flash_attn_generic_traits(
     paged = bool(paged)
     kv_vectorized = paged and (kv_cache_layout == "vectorized")
     kv_vec_size = 8
-    # Pages smaller than a KV tile are resolved per row (GenericPageIdLoader).
-    page_size = block_n if page_size is None else int(page_size)
-    if paged and page_size != block_n:
-        if not (0 < page_size < block_n and block_n % page_size == 0):
-            raise ValueError(
-                f"generic paged kernel supports page_size dividing {block_n}, "
-                f"got {page_size}"
-            )
-        if kv_vectorized or n_subtiles != 1:
-            raise ValueError(
-                f"generic paged kernel supports page_size < {block_n} only with "
-                "the linear kv_cache_layout on a single-subtile (N32) path"
-            )
     page_stride_vec = num_kv_heads * head_dim * page_size
     head_stride_vec = head_dim * page_size
 

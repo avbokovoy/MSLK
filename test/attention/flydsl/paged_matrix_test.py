@@ -452,6 +452,74 @@ def test_wave_splitk_engages():
     _check(case, got, _reference(case, x))
 
 
+def _small_pages(x: Inputs, page_size: int) -> Inputs:
+    """``x`` with each 64-row page split into ``page_size``-row pages; logical
+    page p maps to the physical sub-pages of the page it was in."""
+    sub = PAGE // page_size
+    pages, _, hkv, d = x.k.shape
+    table = x.block_table.long()
+    sub_ids = torch.arange(sub, device="cuda")
+    table = (table[..., None] * sub + sub_ids).flatten(1)
+    table = table.masked_fill(x.block_table.repeat_interleave(sub, 1) < 0, -1)
+    return replace(
+        x,
+        k=x.k.reshape(pages * sub, page_size, hkv, d),
+        v=x.v.reshape(pages * sub, page_size, hkv, d),
+        block_table=table.to(torch.int32),
+    )
+
+
+# Shapes whose 64-row-page build takes K prefetch, K/V DMA or page-id
+# registers, which read one page per KV tile; smaller pages must build without.
+SMALL_PAGE_CASES = [
+    # Long-KV prefill (K prefetch).
+    Case(1, 100, 4096, D=64, H=16, HKV=2),
+    # Packed-GQA decode with explicit splits (K prefetch at D=128).
+    Case(1, 1, 4096, num_kv_splits=4),
+    # Tall packed-GQA tile at D=64 over a long context (K/V DMA).
+    Case(1, 16, 16384, D=64, H=16, HKV=2, num_kv_splits=2),
+    # D=256 over a long context, ragged.
+    Case(2, 1, 4096, D=256, lengths="ragged"),
+]
+
+
+@pytest.mark.parametrize("page_size", [16, 32])
+@pytest.mark.parametrize("case", SMALL_PAGE_CASES, ids=lambda c: c.id)
+def test_small_pages_skip_tile_page_features(monkeypatch, case, page_size):
+    """Pages below the 64-row KV tile build without the features that assume
+    one page per tile, and match the reference."""
+    routes = Routes(monkeypatch)
+    x = _small_pages(_make_inputs(case), page_size)
+    got = _call(case, x)
+    assert routes.take() == "light"
+    traits = routes.light_traits()
+    assert traits.PAGE_SIZE == page_size
+    assert not traits.PAGED_K_PREFETCH
+    assert not traits.ENABLE_DMA
+    assert not traits.PAGED_PID_REGS
+    _check(case, got, _reference(case, x))
+
+
+@pytest.mark.parametrize("page_size", [16, 32])
+def test_small_pages_ignore_dma_env(monkeypatch, page_size):
+    """FLYDSL_FLASH_ATTN_FUNC_ENABLE_DMA, read when the kernel is built, does
+    not turn on K/V DMA for pages below the KV tile."""
+    case = Case(2, 8, 512, lengths="ragged")
+    monkeypatch.setenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_DMA", "1")
+    # Builds are cached; make this one read the environment.
+    build = fai._build_paged_light
+    build.cache_clear()
+    routes = Routes(monkeypatch)
+    x = _small_pages(_make_inputs(case), page_size)
+    try:
+        got = _call(case, x)
+    finally:
+        build.cache_clear()
+    assert routes.take() == "light"
+    assert not routes.light_traits().ENABLE_DMA
+    _check(case, got, _reference(case, x))
+
+
 # Representative case per route for the input variants below.
 ROUTE_REPRESENTATIVES = {
     "swa": Case(16, 1, 4096, window=2047, lengths="ragged"),
