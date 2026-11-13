@@ -185,16 +185,27 @@ def test_wave_splitk_matches_single_split(monkeypatch, D, hkv, dtype):
     torch.testing.assert_close(got.float(), ref.float(), atol=2e-3, rtol=2e-3)
 
 
-def test_native_paged_head_dim_bound():
-    """Native paged KV takes 64 or 128 only.
+def test_native_paged_head_dim_bound(monkeypatch):
+    """Split-K, and so wave split-K, takes head dims 64 and 128 only.
 
     This is what bounds wave-split-K's ``head_dim >= 128`` from above: without
-    it the gate would read as open-ended. If this bound ever widens, the gate
-    inherits head dims it has never run on, so the two must move together.
+    it the gate would read as open-ended. Native paged KV also runs D=256, but
+    never split: auto-sizing keeps one split and an explicit count is refused.
+    If this bound ever widens, the gate inherits head dims it has never run on,
+    so the two must move together. Head dims past 256 are still rejected.
     """
     args = _paged_inputs(1, 1, 8192, 256)
-    with pytest.raises(NotImplementedError, match="head_dim=64 or 128"):
-        _run(*args)
+    builds = spy(monkeypatch, fai, "_build_paged_light")
+    got = _run(*args)
+    assert [b["num_kv_splits"] for b in builds] == [1]
+    assert not builds.results[-1].traits.ENABLE_WAVE_SPLITK
+    q, k, v, block_table, seqlen_k = args
+    ref = paged_reference(q, k, v, block_table, seqlen_k, True)
+    torch.testing.assert_close(got.float(), ref, atol=2e-2, rtol=2e-2)
+    with pytest.raises(ValueError, match="split-K requires D=64/128"):
+        _run(*args, num_kv_splits=4)
+    with pytest.raises(ValueError, match="<= 256"):
+        _run(*_paged_inputs(1, 1, 8192, 320))
 
 
 @pytest.mark.parametrize("num_kv_splits", [0, 1])

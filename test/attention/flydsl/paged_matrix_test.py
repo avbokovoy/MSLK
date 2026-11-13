@@ -736,13 +736,14 @@ def test_rejects_unsupported_cache_shapes():
         _call(case, replace(x, v=x.v[:, :, :2]))
     with pytest.raises(ValueError, match="head_dim"):
         _call(case, replace(x, k=x.k[..., :64], v=x.v[..., :64]))
-    small = replace(
+    # Pages below 64 rows must divide the 64-row KV tile.
+    odd = replace(
         x,
-        k=x.k.reshape(-1, 32, case.HKV, case.D),
-        v=x.v.reshape(-1, 32, case.HKV, case.D),
+        k=x.k.reshape(-1, 48, case.HKV, case.D),
+        v=x.v.reshape(-1, 48, case.HKV, case.D),
     )
     with pytest.raises(NotImplementedError, match="page_size"):
-        _call(case, small, max_seqlen_kv=case.ctx // 2)
+        _call(case, odd, max_seqlen_kv=case.ctx // 2)
 
 
 def test_empty_batch():
