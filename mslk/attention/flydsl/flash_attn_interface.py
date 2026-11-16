@@ -1255,11 +1255,13 @@ def _flydsl_flash_attn_paged(
     # paged kernel and pa_decode_swa.
     window_left: int = -1,
 ) -> torch.Tensor:
-    """Native paged-KV attention on the gfx950 dualwave kernel.
+    """Native paged-KV attention (generic light, gfx950 dualwave or decode kernels).
 
     Supported config ONLY (anything else raises): linear/vectorized cache layout
-    [NumBlocks, PageSize=64, NumKVHeads, HeadDim], vLLM lookup (block_table +
-    seqlen_k), causal, D=64/128, dtype bf16/f16.
+    [NumBlocks, PageSize, NumKVHeads, HeadDim] with PageSize=64, or 16/32 on the
+    linear layout (light kernel); vLLM lookup (block_table + seqlen_k), causal or not,
+    D=64/128/256 (other even D <= 256 masked at the next, linear only), dtype
+    bf16/f16. Split-K needs D=64/128.
     - Dense 4D Q ``[B, Sq, H, D]``: split-K supported at any Sq. On the light
       route ``num_kv_splits`` 0 and 1 size the count from KV-chain length
       (``_paged_auto_num_kv_splits``); ``>1`` forces.
@@ -1342,8 +1344,8 @@ def _flydsl_flash_attn_paged(
         )
     if vectorized and _masked_hd:
         raise NotImplementedError(
-            "flydsl_flash_attn_func: vectorized paged KV supports head_dim 64 or 128 "
-            f"only, got {D}"
+            "flydsl_flash_attn_func: vectorized paged KV supports head_dim 64, 128 "
+            f"or 256 only, got {D}"
         )
 
     _validate_paged_metadata("block_table", block_table, q.device, 2, B)
@@ -1552,16 +1554,28 @@ def _flydsl_flash_attn_paged(
     else:
         page_size = int(k.shape[1])
         k_head_dim = int(k.shape[3])
-    # Gappy paged uses the generic kernel (any D the generic path builds; the op
-    # reshapes the cache to 64-row sub-pages), so skip the native-paged D/page gates.
+    # Gappy paged uses the generic kernel (any D the generic path builds; the fmha
+    # op splits larger pages into 64-row sub-pages and passes divisors of 64
+    # as-is), so skip the native-paged D/page gates.
     _gappy = kv_seqstart is not None
-    if page_size != _PAGED_PAGE_SIZE and not _gappy:
+    # Pages below the 64-row KV tile and D=256 use the light kernel (linear only).
+    _small_pages = page_size < _PAGED_PAGE_SIZE
+    if _small_pages and (vectorized or _PAGED_PAGE_SIZE % page_size != 0):
         raise NotImplementedError(
-            f"flydsl_flash_attn_func: native paged KV supports page_size={_PAGED_PAGE_SIZE} only, got {page_size}"
+            "flydsl_flash_attn_func: paged KV with page_size < "
+            f"{_PAGED_PAGE_SIZE} needs a page_size dividing {_PAGED_PAGE_SIZE} and "
+            f"the linear layout, got page_size={page_size}, "
+            f"layout={kv_cache_layout!r}"
         )
-    if D_run not in (64, 128) and not _gappy:
+    if page_size > _PAGED_PAGE_SIZE and not _gappy:
         raise NotImplementedError(
-            f"flydsl_flash_attn_func: native paged KV supports head_dim=64 or 128, got {D}"
+            "flydsl_flash_attn_func: native paged KV supports page_size<="
+            f"{_PAGED_PAGE_SIZE}, got {page_size}"
+        )
+    if D_run not in (64, 128, 256) and not _gappy:
+        raise NotImplementedError(
+            "flydsl_flash_attn_func: native paged KV supports head_dim 64, 128 "
+            f"or 256 (or a head dim masked at one of them), got {D}"
         )
     if k_head_dim != D:
         raise ValueError(
@@ -1585,6 +1599,10 @@ def _flydsl_flash_attn_paged(
         _gappy
         or _paged_window
         or _masked_hd
+        or _small_pages
+        or D_run not in (64, 128)
+        # Dualwave hardcodes 1/sqrt(head_dim); light folds sm_scale.
+        or sm_scale is not None
         or (
             _splitk_dtype_ok
             and (
@@ -1708,7 +1726,8 @@ def _flydsl_flash_attn_paged(
     # low-occupancy shapes (small B / few heads), where single-split paged
     # underutilizes the device. The count was resolved with the route above.
     max_pages_per_split = (max_kv_pages + int(num_kv_splits) - 1) // int(num_kv_splits)
-    if max_pages_per_split > _PAGED_BT_LDS_SIZE:
+    # Only dualwave stages the block table in LDS.
+    if not _paged_light_ok and max_pages_per_split > _PAGED_BT_LDS_SIZE:
         max_supported_kv = _PAGED_BT_LDS_SIZE * int(num_kv_splits) * page_size
         raise NotImplementedError(
             f"flydsl_flash_attn_func: paged KV length {skv} exceeds block-table LDS window "
@@ -1775,9 +1794,18 @@ def _flydsl_flash_attn_paged(
                 D_run,
                 min(Sq, _paged_bm),
             )
-            # A masked build reads K/V through the cooperative loads only.
-            _k_prefetch = not _masked_hd and _paged_k_prefetch(
-                D_run, window_left, _gqa_qlen if _gqa_packed else Sq, skv, num_kv_splits
+            # A masked build reads K/V through the cooperative loads only, and
+            # pages below a KV tile have no K prefetch, K/V DMA or pid registers.
+            _k_prefetch = (
+                not _masked_hd
+                and not _small_pages
+                and _paged_k_prefetch(
+                    D_run,
+                    window_left,
+                    _gqa_qlen if _gqa_packed else Sq,
+                    skv,
+                    num_kv_splits,
+                )
             )
             if _paged_light_ok:
                 exe = _build_paged_light(
@@ -1805,6 +1833,7 @@ def _flydsl_flash_attn_paged(
                     kv_lens=_dense_kv_lens,
                     block_m=_paged_bm,
                     kv_dma=not _masked_hd
+                    and not _small_pages
                     and _paged_kv_dma(
                         _paged_bm, D_run, window_left, skv, num_kv_splits
                     ),
@@ -1812,9 +1841,12 @@ def _flydsl_flash_attn_paged(
                     window_left=window_left,
                     num_kv_splits=int(num_kv_splits),
                     fused_combine=fused_combine,
-                    pid_regs=_paged_pid_regs(max_pages_per_split) and not _k_prefetch,
+                    pid_regs=not _small_pages
+                    and _paged_pid_regs(max_pages_per_split)
+                    and not _k_prefetch,
                     head_dim_qk=D,
                     head_dim_v=D,
+                    page_size=page_size,
                 )
             else:
                 exe = _build_paged(
@@ -1956,6 +1988,7 @@ def _build_paged_light(
     pid_regs: bool = False,
     head_dim_qk: Optional[int] = None,
     head_dim_v: Optional[int] = None,
+    page_size: int = _PAGED_PAGE_SIZE,
 ):
     """Build a lightweight paged-varlen launcher for short attention.
 
@@ -1997,6 +2030,7 @@ def _build_paged_light(
         paged_pid_regs=pid_regs,
         head_dim_qk=head_dim_qk,
         head_dim_v=head_dim_v,
+        page_size=page_size,
     )
 
 
@@ -2089,6 +2123,8 @@ def flydsl_flash_attn_func(
              ``V = [NumBlocks, NumKVHeads, PageSize / kVectorSize, HeadDim, kVectorSize]``.
              Here ``kVectorSize = 16 / element_size`` (bf16/fp16: 8, fp8: 16);
              page_size and head_dim must be divisible by it.
+           Native paged KV takes PageSize 64, or 16/32 with the ``linear``
+           layout; head dims as below, including 256; and a custom ``sm_scale``.
         causal: Bottom-right aligned causal mask when True.
         num_kv_heads: KV head count for GQA/MQA; defaults to q num_heads (MHA).
         cu_seqlens_q: Int32 ``[B+1]`` cumulative Q token counts (varlen).
@@ -2195,15 +2231,12 @@ def flydsl_flash_attn_func(
             )
         # The kernels keep KV in (q_row - w, q_row], an exclusive left bound.
         window_left += 1
-    if sm_scale is not None:
-        # fp8 and native paged hardcode 1/sqrt(head_dim); gappy paged uses the
-        # generic kernel and folds sm_scale.
-        _gappy_paged = paged_kv and kv_seqstart is not None
-        if dtype_str == "fp8" or (paged_kv and not _gappy_paged):
-            raise NotImplementedError(
-                "flydsl_flash_attn_func: custom sm_scale is only supported on the "
-                "dense/varlen f16/bf16 paths (fp8/paged hardcode 1/sqrt(head_dim))"
-            )
+    if sm_scale is not None and dtype_str == "fp8":
+        # fp8 hardcodes 1/sqrt(head_dim).
+        raise NotImplementedError(
+            "flydsl_flash_attn_func: custom sm_scale is only supported for "
+            "f16/bf16 (fp8 hardcodes 1/sqrt(head_dim))"
+        )
     if bias is not None:
         if bias.device != q.device or bias.dtype != q.dtype:
             raise ValueError("bias must have the query device and dtype")

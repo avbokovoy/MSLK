@@ -1652,6 +1652,7 @@ def _make_flash_attn_generic_traits(
     paged_pid_regs=False,
     head_dim_qk=None,
     head_dim_v=None,
+    page_size=None,
 ):
     """Build compile-time traits for ``flash_attn_generic``."""
     block_n = 64
@@ -1707,6 +1708,25 @@ def _make_flash_attn_generic_traits(
     block_n_out = 128 if path == "N128" else block_n
     n_subtiles = block_n_out // block_n
 
+    # Pages smaller than a KV tile are resolved per row (GenericPageIdLoader).
+    page_size = block_n if page_size is None else int(page_size)
+    small_pages = bool(paged) and page_size != block_n
+    if small_pages:
+        if not (0 < page_size < block_n and block_n % page_size == 0):
+            raise ValueError(
+                f"generic paged kernel supports page_size dividing {block_n}, "
+                f"got {page_size}"
+            )
+        if kv_cache_layout == "vectorized" or n_subtiles != 1:
+            raise ValueError(
+                f"generic paged kernel supports page_size < {block_n} only with "
+                "the linear kv_cache_layout on a single-subtile (N32) path"
+            )
+        # Paged DMA, K prefetch and pid registers read one page per tile.
+        paged_kv_dma = False
+        paged_k_prefetch = False
+        paged_pid_regs = False
+
     enable_prefetch_3buf = (
         os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_PREFETCH3", "0") == "1"
         and not masked_paged
@@ -1740,6 +1760,7 @@ def _make_flash_attn_generic_traits(
             and not gpu_arch.startswith("gfx942")
             and kv_cache_layout == "linear"
             and not gappy_kv
+            and not small_pages
         )
         enable_dma = paged_dma_ok and (enable_dma or paged_kv_dma)
     enable_gfx942_kv_gpfetch = (
@@ -1822,7 +1843,6 @@ def _make_flash_attn_generic_traits(
     paged = bool(paged)
     kv_vectorized = paged and (kv_cache_layout == "vectorized")
     kv_vec_size = 8
-    page_size = block_n
     page_stride_vec = num_kv_heads * head_dim * page_size
     head_stride_vec = head_dim * page_size
 
@@ -3232,23 +3252,30 @@ class GenericPageIdLoader:
         )
         return fx.Index(Vec(v, (1,), fx.Int32)[0])
 
-    def gappy_tile_pages(self, base_logical):
-        # A tile covers 64 logical KV positions [base_logical, base_logical+64), and
-        # PAGE_SIZE == BLOCK_N == 64, so it spans at most two physical pages. Load
-        # both once per tile (2 block_table loads) instead of one per row.
+    def window_pages(self):
+        # Pages one tile can touch; +1 for gappy (unaligned per-seq start).
+        traits = self.ctx.traits
+        n = max(traits.BLOCK_N // traits.PAGE_SIZE, 1)
+        return n + 1 if traits.GAPPY_KV else n
+
+    def tile_pages(self, base_logical):
+        # Load the tile's page ids once instead of per row.
         ps = fx.Index(self.ctx.traits.PAGE_SIZE)
         tile_base_page = base_logical // ps
-        p0 = self._bt_load(tile_base_page)
-        p1 = self._bt_load(tile_base_page + fx.Index(1))
-        return (p0, p1, tile_base_page)
+        pages = [
+            self._bt_load(tile_base_page + fx.Index(i))
+            for i in range_constexpr(self.window_pages())
+        ]
+        return (pages, tile_base_page)
 
-    def page_row_idx_cached(self, pages, logical):
-        # Select p0/p1 by which of the tile's two pages `logical` falls in (pure
-        # arithmetic, no memory load).
+    def page_row_idx_cached(self, window, logical):
+        # Select the page `logical` falls in (no memory load).
         ps = fx.Index(self.ctx.traits.PAGE_SIZE)
-        p0, p1, tile_base_page = pages
-        crosses = (logical // ps) > tile_base_page
-        pid = crosses.select(p1, p0)
+        pages, tile_base_page = window
+        rel = logical // ps - tile_base_page
+        pid = pages[0]
+        for i in range_constexpr(1, len(pages)):
+            pid = (rel >= fx.Index(i)).select(pages[i], pid)
         return pid * ps + logical % ps
 
 
@@ -3330,12 +3357,14 @@ class GenericKvGmemToLdsLoader:
     def sigma_kv(self, n):
         return self.ctx.sigma_kv(n)
 
+    def _multi_page_tile(self):
+        traits = self.ctx.traits
+        return traits.GAPPY_KV or traits.PAGE_SIZE < traits.BLOCK_N
+
     def _tile_page_id(self, tile_start):
-        # Normal paged: one page id per tile. Gappy paged: the per-seq logical start
-        # can be non-page-aligned, so a tile spans up to two physical pages -- return
-        # both (loaded once per tile) and select per row in _paged_row_idx.
-        if const_expr(self.ctx.traits.GAPPY_KV):
-            return self.page_ids.gappy_tile_pages(self.ctx.kv_seq_start + tile_start)
+        # Multi-page tiles return the page window; _paged_row_idx selects per row.
+        if const_expr(self._multi_page_tile()):
+            return self.page_ids.tile_pages(self.ctx.kv_seq_start + tile_start)
         return self.page_ids.page_id(tile_start)
 
     def _kv_row_idx(self, pid, tile_start, row_in_tile):
@@ -3346,11 +3375,10 @@ class GenericKvGmemToLdsLoader:
         return self.row_clamp(tile_start + row_in_tile)
 
     def _paged_row_idx(self, pid, tile_start, row_total):
-        # Physical KV row for a paged load. Normal paged: row_idx = pid*PAGE_SIZE +
-        # row. Gappy paged: resolve the row's page from the cached 2-page tile window.
+        # Physical KV row for a paged load.
         ctx = self.ctx
         traits = ctx.traits
-        if const_expr(traits.GAPPY_KV):
+        if const_expr(self._multi_page_tile()):
             logical = ctx.kv_seq_start + tile_start + row_total
             return self.page_ids.page_row_idx_cached(pid, logical)
         return pid * fx.Index(traits.PAGE_SIZE) + row_total

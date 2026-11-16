@@ -93,6 +93,7 @@ def build_flash_attn_func_module_primary(
     paged_pid_regs=False,
     head_dim_qk=None,
     head_dim_v=None,
+    page_size=None,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
@@ -154,6 +155,7 @@ def build_flash_attn_func_module_primary(
             num_kv_splits=num_kv_splits,
             head_dim_qk=head_dim_qk,
             head_dim_v=head_dim_v,
+            page_size=page_size,
         )
         _launcher_m256 = build_flash_attn_func_module_primary(
             num_heads,
@@ -185,6 +187,7 @@ def build_flash_attn_func_module_primary(
             num_kv_splits=num_kv_splits,
             head_dim_qk=head_dim_qk,
             head_dim_v=head_dim_v,
+            page_size=page_size,
         )
         _bs_threshold = (
             2048 * num_heads if gpu_arch.startswith("gfx942") else 4096 * num_heads
@@ -291,6 +294,7 @@ def build_flash_attn_func_module_primary(
         paged_pid_regs=paged_pid_regs,
         head_dim_qk=head_dim_qk,
         head_dim_v=head_dim_v,
+        page_size=page_size,
     )
     # Threads per combine block; a block is the unit of CU assignment, so this
     # sets how many workgroups the combine launches. One wave per block spreads
@@ -1220,6 +1224,7 @@ def build_flash_attn_func_module_primary(
             num_kv_splits=num_kv_splits,
             head_dim_qk=head_dim_qk,
             head_dim_v=head_dim_v,
+            page_size=page_size,
         )
         _launch_mask = build_flash_attn_func_module_primary(
             num_heads,
@@ -1251,6 +1256,7 @@ def build_flash_attn_func_module_primary(
             num_kv_splits=num_kv_splits,
             head_dim_qk=head_dim_qk,
             head_dim_v=head_dim_v,
+            page_size=page_size,
         )
 
         def _pad_dispatch(*args, **kwargs):

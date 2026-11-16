@@ -286,6 +286,8 @@ def create_tensors(  # noqa: C901
         if op is not None and issubclass(op, fmha.triton_splitk.FwOp):
             # TODO: enable small pages for flash attention when that's implemented
             page_size_choices.extend([64, 128])
+        if op is not None and issubclass(op, fmha.flydsl.FwOp):
+            page_size_choices.extend([16, 32, 64, 128])
         page_size = random.choice(page_size_choices)
         kv_len_paged = (kv_len + page_size - 1) // page_size * page_size
     else:

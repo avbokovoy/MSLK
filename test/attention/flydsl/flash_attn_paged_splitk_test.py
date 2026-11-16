@@ -25,7 +25,7 @@ from mslk.attention.flydsl.flash_attn_interface import (
 from mslk.flydsl.common import is_flydsl_available
 from paged_reference import paged_reference, run_on_busy_side_stream, spy
 
-PAGE = 64  # _PAGED_PAGE_SIZE: the only page size the native paged kernel takes
+PAGE = 64  # _PAGED_PAGE_SIZE: one page per KV tile, the page size these tests use
 H, HKV = 32, 4
 
 
@@ -185,16 +185,27 @@ def test_wave_splitk_matches_single_split(monkeypatch, D, hkv, dtype):
     torch.testing.assert_close(got.float(), ref.float(), atol=2e-3, rtol=2e-3)
 
 
-def test_native_paged_head_dim_bound():
-    """Native paged KV takes 64 or 128 only.
+def test_native_paged_head_dim_bound(monkeypatch):
+    """Split-K, and so wave split-K, takes head dims 64 and 128 only.
 
     This is what bounds wave-split-K's ``head_dim >= 128`` from above: without
-    it the gate would read as open-ended. If this bound ever widens, the gate
-    inherits head dims it has never run on, so the two must move together.
+    it the gate would read as open-ended. Native paged KV also runs D=256, but
+    never split: auto-sizing keeps one split and an explicit count is refused.
+    If this bound ever widens, the gate inherits head dims it has never run on,
+    so the two must move together. Head dims past 256 are still rejected.
     """
     args = _paged_inputs(1, 1, 8192, 256)
-    with pytest.raises(NotImplementedError, match="head_dim=64 or 128"):
-        _run(*args)
+    builds = spy(monkeypatch, fai, "_build_paged_light")
+    got = _run(*args)
+    assert [b["num_kv_splits"] for b in builds] == [1]
+    assert not builds.results[-1].traits.ENABLE_WAVE_SPLITK
+    q, k, v, block_table, seqlen_k = args
+    ref = paged_reference(q, k, v, block_table, seqlen_k, True)
+    torch.testing.assert_close(got.float(), ref, atol=2e-2, rtol=2e-2)
+    with pytest.raises(ValueError, match="split-K requires D=64/128"):
+        _run(*args, num_kv_splits=4)
+    with pytest.raises(ValueError, match="<= 256"):
+        _run(*_paged_inputs(1, 1, 8192, 320))
 
 
 @pytest.mark.parametrize("num_kv_splits", [0, 1])
@@ -1340,7 +1351,10 @@ def test_chain_sized_splits_respect_workspace(monkeypatch):
 
 def test_window_sized_splits_respect_workspace_after_lds_floor(monkeypatch):
     """The block-table floor raises a windowed split count only while the
-    workspace stays in budget; past that the shape is left to be rejected."""
+    workspace stays in budget. Past that a split walks more pages than the
+    block-table LDS window: the light kernel, which reads page ids from the
+    block table directly, still runs it; only the dualwave route, which stages
+    the block table in LDS, rejects it."""
     monkeypatch.setattr(fai, "_PAGED_WS_BUDGET_MB", 1)
     batch, heads, seqlen_q, head_dim = 4, 8, 64, 128
     max_kv_pages = 2 * fai._PAGED_BT_LDS_SIZE
